@@ -33,7 +33,8 @@ Two LoRA adapters on one language model play a game, in the spirit of a GAN:
 
 1. Put the SD card in the PC and open the `adversarial-coder` folder.
 2. Double-click **`setup.bat`** and leave it running; it needs internet. It downloads everything
-   into `tools\` and `.venv\` on the card: uv + Python 3.12, PyTorch (CPU or CUDA, picked automatically),
+   into `tools\` and `.venv\` inside this folder: uv + Python 3.12, PyTorch (the CUDA build if an NVIDIA GPU is
+   found, otherwise the small CPU build),
    Node.js + Pi, PortableGit (for Pi's bash), and llama.cpp. Then it:
    - detects the hardware and picks a **profile** (written to `state\hardware.json`);
    - asks where to put the **models** (press Enter for the card, or give a folder on the PC's own drive
@@ -222,6 +223,10 @@ consulted (so it doesn't take memory from training).
 ## 7. Troubleshooting
 
 - **Setup fails downloading:** run `setup.bat` again; it resumes and skips what's already there.
+- **"There is not enough space on the disk" (os error 112):** setup checks free space first and needs
+  ~3-4 GB for tools plus ~9-13 GB for the CPU models. Delete any older copy of this folder (its
+  `tools\uv-cache` and `.venv` can be several GB), or clone onto a drive with more room. Older versions of
+  setup picked PyTorch's multi-GB Intel GPU (XPU) build on PCs with Intel graphics; that is fixed.
 - **"Model not found":** run setup again, or `python -m adv.download --models-dir <folder>`.
 - **Self-test says the engine is `hf`:** llama.cpp couldn't apply the LoRA on this machine. Training
   still works, just slower. Details are in `state\engine.json`.

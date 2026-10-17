@@ -39,10 +39,20 @@ function Expand-To($zip, $dest) {
 
 $env:UV_PYTHON_INSTALL_DIR = Join-Path $Tools "python"
 $env:UV_CACHE_DIR          = Join-Path $Tools "uv-cache"
-$env:UV_LINK_MODE          = "copy"        # exFAT has no hard links
+# (no UV_LINK_MODE: uv hard-links from its cache on NTFS and falls back to copying on exFAT by itself)
 $env:HF_HOME               = Join-Path $Tools "hf-home"
 $env:HF_HUB_DISABLE_SYMLINKS_WARNING = "1"
 $env:PYTHONUTF8 = "1"
+
+# ---------------------------------------------------------------- 0. free disk space
+$drive = New-Object System.IO.DriveInfo ([System.IO.Path]::GetPathRoot($Root))
+$freeGB = [math]::Round($drive.AvailableFreeSpace / 1GB, 1)
+Say "0/7 free space on $($drive.Name): $freeGB GB"
+if ($freeGB -lt 5) {
+    throw ("Only $freeGB GB free on $($drive.Name). Setup needs about 3-4 GB for tools (more with an NVIDIA GPU), " +
+           "plus about 9-13 GB for the CPU models. Free some space (for example delete an older copy of this folder, " +
+           "including its tools\uv-cache), or clone the repo onto a drive with more room.")
+}
 
 # ---------------------------------------------------------------- 1. uv + Python
 Say "1/7 uv (Python manager) and Python 3.12"
@@ -55,13 +65,17 @@ $py = Join-Path $Root ".venv\Scripts\python.exe"
 if (-not (Test-Path $py)) { & $uv venv (Join-Path $Root ".venv") --python 3.12 --managed-python; Check "creating the Python environment" }
 
 # ---------------------------------------------------------------- 2. Python packages
-Say "2/7 Python packages (torch picks CPU or CUDA automatically)"
+Say "2/7 Python packages"
 $nvsmi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
 $hasNvidia = [bool]$nvsmi
 if ($hasNvidia) { & nvidia-smi --query-gpu=name,memory.total --format=csv,noheader }
 else { Write-Host "    no NVIDIA GPU found -> CPU build" }
-& $uv pip install --python $py "torch==$TORCH" --torch-backend auto; Check "installing torch"
+# Explicit backend: "auto" also detects Intel integrated graphics and would pick the multi-GB Intel XPU build.
+if ($hasNvidia) { $torchBackend = "auto" } else { $torchBackend = "cpu" }
+Write-Host "    torch backend: $torchBackend"
+& $uv pip install --python $py "torch==$TORCH" --torch-backend $torchBackend; Check "installing torch"
 & $uv pip install --python $py -r (Join-Path $Root "requirements.txt"); Check "installing Python packages"
+& $uv cache clean | Out-Null   # keep only what is installed
 if ($hasNvidia) {
     & $uv pip install --python $py "bitsandbytes==0.50.2"; Check "installing bitsandbytes"
     # optional fast kernels for the Gated-DeltaNet layers; training works without them, just slower

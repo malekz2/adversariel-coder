@@ -17,6 +17,11 @@ while [ $# -gt 0 ]; do
   esac
 done
 mkdir -p "$TOOLS" "$DL" "$ROOT/state"
+FREE_GB=$(df -Pk "$ROOT" | awk 'NR==2 {printf "%.1f", $4/1048576}')
+echo "free space for $ROOT: $FREE_GB GB"
+if awk "BEGIN {exit !($FREE_GB < 5)}"; then
+  echo "Only $FREE_GB GB free. Setup needs ~3-4 GB for tools plus ~9-13 GB for CPU models. Free space or clone elsewhere."; exit 1
+fi
 say() { printf '\n\033[36m==> %s\033[0m\n' "$*"; }
 fetch() { [ -f "$DL/$2" ] || { echo "    downloading $1"; curl -fL --retry 3 -o "$DL/$2.part" "$1"; mv "$DL/$2.part" "$DL/$2"; }; }
 
@@ -31,7 +36,7 @@ esac
 HAS_NVIDIA=0; command -v nvidia-smi >/dev/null 2>&1 && HAS_NVIDIA=1
 [ "$HAS_NVIDIA" = 1 ] && [ "$OS" = Linux ] && [ "$ARCH" = x86_64 ] && LL_T=ubuntu-cuda-12.8-x64
 
-export UV_PYTHON_INSTALL_DIR="$TOOLS/python" UV_CACHE_DIR="$TOOLS/uv-cache" UV_LINK_MODE=copy
+export UV_PYTHON_INSTALL_DIR="$TOOLS/python" UV_CACHE_DIR="$TOOLS/uv-cache"   # uv falls back to copying on exFAT by itself
 export HF_HOME="$TOOLS/hf-home" HF_HUB_DISABLE_SYMLINKS_WARNING=1
 
 say "1/7 uv and Python 3.12"
@@ -43,7 +48,10 @@ UV="$TOOLS/uv/uv"; PY="$ROOT/.venv/bin/python"
 [ -x "$PY" ] || "$UV" venv "$ROOT/.venv" --python 3.12 --managed-python
 
 say "2/7 Python packages"
-"$UV" pip install --python "$PY" "torch==$TORCH" --torch-backend auto
+# explicit backend: "auto" also detects Intel/AMD GPUs and would pick a multi-GB XPU/ROCm build
+TORCH_BACKEND=cpu; [ "$HAS_NVIDIA" = 1 ] && TORCH_BACKEND=auto
+echo "    torch backend: $TORCH_BACKEND"
+"$UV" pip install --python "$PY" "torch==$TORCH" --torch-backend "$TORCH_BACKEND"
 "$UV" pip install --python "$PY" -r "$ROOT/requirements.txt"
 if [ "$HAS_NVIDIA" = 1 ]; then
   "$UV" pip install --python "$PY" bitsandbytes==0.50.2
