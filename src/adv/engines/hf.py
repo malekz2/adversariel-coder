@@ -57,6 +57,7 @@ class HFEngine(Engine):
     def generate(self, prompt_ids, params: GenParams, think_end: int | None) -> GenResult:
         tok, model = self.tok, self.policy.model
         with self.lock, torch.no_grad():
+            self.policy.onload()  # HF engine samples from the training weights, so they must be on the GPU
             self.policy.use_adapter(params.adapter)
             was_training = model.training
             model.eval()

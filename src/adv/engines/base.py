@@ -44,7 +44,7 @@ class Engine(ABC):
     def resume(self):
         pass
 
-    def sync_adapters(self, adapter_dirs: dict[str, str]):
+    def sync_adapters(self, adapter_dirs: dict[str, str], restart: bool = True):
         """Load freshly trained LoRA adapters ({"maker": dir, "solver": dir})."""
 
     @abstractmethod

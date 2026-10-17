@@ -45,7 +45,9 @@ def detect() -> dict:
         if torch.cuda.is_available():
             info["torch_cuda"] = True
             props = torch.cuda.get_device_properties(0)
-            info["cuda_device"] = {"name": props.name, "vram_gb": round(props.total_memory / 1e9, 1)}
+            free, _ = torch.cuda.mem_get_info(0)
+            info["cuda_device"] = {"name": props.name, "vram_gb": round(props.total_memory / 1e9, 1),
+                                   "vram_free_gb": round(free / 1e9, 1)}
     except Exception as e:  # torch missing or broken
         info["torch_error"] = str(e)
     return info
@@ -56,8 +58,8 @@ def pick_profile(info: dict) -> str:
     if vram >= 23.5:
         return "cuda_large"
     gpu = ((info.get("cuda_device") or {}).get("name") or "").lower()
-    if 10 <= vram < 14 or "2080 ti" in gpu:   # e.g. Purdue LWSN B131's RTX 2080 Ti (11 GB)
-        return "lawson_b131"
+    if 10 <= vram < 14 or "2080 ti" in gpu:   # RTX 2080 Ti (11 GB), RTX 3060 (12 GB), ...
+        return "cuda_mid"
     if vram >= 7.5:
         return "cuda_small"
     ram = info.get("ram_gb", 0)
@@ -70,6 +72,13 @@ def main():
     info = detect()
     info["profile"] = pick_profile(info)
     print(json.dumps(info, indent=2))
+    dev = info.get("cuda_device") or {}
+    if dev and dev["vram_gb"] - dev.get("vram_free_gb", dev["vram_gb"]) > 1.5:
+        print(f"NOTE: {dev['vram_gb'] - dev['vram_free_gb']:.1f} GB of VRAM is already in use (the display or other apps). "
+              "Close other GPU programs before training.")
+    if info["profile"] == "cuda_large" and info.get("ram_gb", 0) < 30:
+        print("NOTE: the 27B profile parks a ~19 GB trainer in RAM during rollouts; this PC has "
+              f"{info.get('ram_gb')} GB. If it runs out of memory, use --profile cuda_small.")
     if len(sys.argv) > 2 and sys.argv[1] == "--write":
         with open(sys.argv[2], "w", encoding="utf-8") as f:
             json.dump(info, f, indent=2)

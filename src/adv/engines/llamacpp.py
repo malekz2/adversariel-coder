@@ -130,8 +130,8 @@ class LlamaCppEngine(Engine):
     def resume(self):
         self.start()
 
-    def sync_adapters(self, adapter_dirs: dict[str, str]):
-        """Convert PEFT adapters to GGUF and restart the server with them."""
+    def sync_adapters(self, adapter_dirs: dict[str, str], restart: bool = True):
+        """Convert PEFT adapters to GGUF and (re)start the server with them (or leave it stopped)."""
         assert self.adapter_gguf_dir is not None
         self.adapter_gguf_dir.mkdir(parents=True, exist_ok=True)
         new_files = {}
@@ -146,7 +146,8 @@ class LlamaCppEngine(Engine):
         for name, (tmp, out) in new_files.items():
             os.replace(tmp, out)
             self.adapter_files[name] = out
-        self.start()
+        if restart:
+            self.start()
 
     # ------------------------------------------------------------ generation
     def _complete(self, prompt_ids, n_predict, params: GenParams, bias: dict, stop: list[str]) -> dict:

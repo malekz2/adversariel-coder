@@ -79,8 +79,8 @@ read and which allows files over 4 GB.
 
 | profile | when | model trained (LoRA) | rollouts | rough time / step* |
 |---|---|---|---|---|
-| `cuda_large` | NVIDIA ≥ 24 GB VRAM | **Qwen3.8-27B**, 4-bit NF4 (QLoRA) | `Qwen3.8-27B-UD-IQ4_XS.gguf` | 15–30 min |
-| `lawson_b131` | NVIDIA 10–14 GB, e.g. **RTX 2080 Ti** (Purdue LWSN B131) | **K2-Horizon-3.7B**, NF4, fp16 | `K2-Horizon-4B-Q4_K_M.gguf` | 20–60 min |
+| `cuda_large` | NVIDIA ≥ 24 GB VRAM + ~32 GB RAM, e.g. **RTX 4090 (Purdue LWSN B131)** | **Qwen3.8-27B**, 4-bit NF4 (QLoRA) | `Qwen3.8-27B-UD-IQ4_XS.gguf` | 15–30 min |
+| `cuda_mid` | NVIDIA 10–14 GB, e.g. RTX 2080 Ti | K2-Horizon-3.7B, NF4, fp16 | `K2-Horizon-4B-Q4_K_M.gguf` | 20–60 min |
 | `cuda_small` | NVIDIA 8–10 or 14–24 GB | Qwen3.5-4B, NF4 | Qwen3.5-4B Q4_K_M | 5–15 min |
 | `cpu` | **no NVIDIA, ≥ 28 GB RAM** (OptiPlex with 32 GB) | **K2-Horizon-7B**, bf16 | `K2-Horizon-7B-Q4_K_M.gguf` | **3–8 hours** |
 | `cpu_small` | no NVIDIA, 14–28 GB RAM | Qwen3.5-2B, fp32 | Qwen3.5-2B Q4_K_M | 45–120 min |
@@ -91,16 +91,38 @@ measurements. The **ETA in `log.txt` is the real number**; it settles after abou
 the slow part on CPU: every step back-propagates through ~50–100k tokens. To go faster, use `--no-pi`
 (shorter sequences, roughly 2–3× faster), `--profile cpu_small` / `cpu_tiny`, or fewer `grpo.solver_attempts`.
 
-**Purdue Lawson labs** (from the CS department's lab pages): only **LWSN B131** has a GPU, an
-**RTX 2080 Ti with 11 GB of VRAM**. Those PCs (Dell Precision 5810) have 16 GB of system RAM, a
-4-core Xeon E5-1603 and Windows 10. Setup picks `lawson_b131` there automatically: QLoRA on
-K2-Horizon-3.7B, the same model family and chat format as the CPU default. In 4-bit the trainer needs
-about 4.5 GB and the llama.cpp GGUF 3.2 GB, so both fit on the card, and llama-server pauses during
-training to give activations room. The 2080 Ti (Turing) has no native bf16, so training uses fp16 with
-loss scaling (a gradient scaler skips any step whose gradients overflow). Downloads ≈ 20 GB. The
-other Lawson labs (B146, B148, B158, B160) have no GPU and 16 GB of RAM: they get `cpu_small`
-(Qwen3.5-2B), since K2-Horizon-7B needs about 28 GB. Lab hardware changes, so `setup.bat` prints
-what it actually finds.
+**Purdue Lawson LWSN B131: RTX 4090 (24 GB VRAM) + 32 GB RAM → `cuda_large`, the real 27B run.**
+Measured on the machine itself (the CS department's lab page still lists an older RTX 2080 Ti). Setup
+detects the 4090 and picks `cuda_large` automatically: QLoRA on **Qwen3.8-27B**, with rollouts from your
+`UD-IQ4_XS` GGUF. It only fits on 24 GB because of three memory tricks (budget from the model's real
+dimensions):
+
+| on the GPU | without tricks | with them |
+|---|---|---|
+| 4-bit layers (24.4B params) + 16-bit embeddings/output layer (248k vocab) | 17.7 GB | 17.7 GB |
+| two LoRA adapters (r=16) + optimizer state | ~3.0 GB | ~1.5 GB (paged 8-bit AdamW) |
+| activations saved for backward, 8k tokens | ~5.4 GB | ~0.3 GB (kept in pinned RAM) |
+| working memory, logits, CUDA | ~2.5 GB | ~2.5 GB |
+| **total while training** | **~28.6 GB: does not fit** | **~22 GB** |
+
+The 14.3 GB GGUF can't sit next to the trainer either, so each step alternates. During **rollouts** the
+trainer (~19 GB) waits in system RAM and llama.cpp gets the whole GPU (14.3 GB + KV cache for 4 Pi
+attempts in parallel). During **training** llama-server is stopped and the trainer comes back to the
+GPU. Moving it each way takes seconds. This is also why it needs ~32 GB of system RAM.
+
+Things to watch on B131:
+- **Close other GPU programs.** If the 4090 also drives the monitor, Windows itself uses ~0.5–1 GB of
+  VRAM. `setup.bat` prints how much is already in use.
+- **Windows "sysmem fallback":** when VRAM runs out, recent NVIDIA drivers silently spill into system RAM
+  instead of crashing, so a step suddenly takes many times longer. If that happens, lower
+  `max_seq_len` / `ctx_per_slot` in the `cuda_large` profile (e.g. to 6144), or use `--profile cuda_small`.
+- **Disk: ~77 GB of models** (55.6 GB BF16 training weights, 14.3 GB GGUF, 6.6 GB referee).
+  Setup checks free space first.
+
+Other Lawson labs (B146, B148, B158, B160, per the department's pages) have no GPU and 16 GB of RAM:
+they get `cpu_small` (Qwen3.5-2B). The `cuda_mid` profile (K2-Horizon-3.7B in fp16, for 10–14 GB cards
+such as a 2080 Ti) stays available for older GPU machines. `setup.bat` always prints what it actually
+finds.
 
 **K2-Horizon-7B on CPU** (the default with no GPU): IFM's dense 7B, chosen for its strong coding and
 agentic scores. It has to train in bf16, because fp32 weights alone would be 36 GB, more than the PC's
@@ -117,8 +139,8 @@ take roughly half a day per step. The 4-bit training library (bitsandbytes) also
 The code is identical across profiles, so a later run on a GPU machine uses the real 27B setup.
 
 **Disk:** tools + Python environment ≈ 3–6 GB. Models (including the 6.6 GB d3-flash referee):
-`cpu` (K2-Horizon-7B) ≈ **30 GB**, `lawson_b131` (K2-Horizon-3.7B) ≈ 20 GB, `cpu_small` ≈ 12.5 GB, `cpu_tiny` ≈ 9 GB, `cuda_small` ≈ 19 GB,
-`cuda_large` ≈ 76 GB. Setup checks free space before downloading. Some lab PCs wipe user folders at
+`cpu` (K2-Horizon-7B) ≈ **30 GB**, `cuda_mid` (K2-Horizon-3.7B) ≈ 20 GB, `cpu_small` ≈ 12.5 GB, `cpu_tiny` ≈ 9 GB, `cuda_small` ≈ 19 GB,
+`cuda_large` (27B) ≈ 77 GB. Setup checks free space before downloading. Some lab PCs wipe user folders at
 logout; if so, keep the models on a USB drive.
 
 ---

@@ -43,3 +43,31 @@ def test_dry_run_then_resume(sandbox_root):
     rows = [json.loads(l) for l in (run / "metrics.jsonl").read_text().splitlines()]
     assert [r["step"] for r in rows] == list(range(6))
     assert (run / "checkpoints" / "latest.txt").read_text().strip() == "step_00006"
+
+
+def test_phases_keep_trainer_and_llama_server_off_the_gpu_at_the_same_time():
+    calls = []
+    stub = SimpleNamespace(
+        offload_trainer=True,
+        policy=SimpleNamespace(offload=lambda: calls.append("trainer -> RAM") or True,
+                               onload=lambda: calls.append("trainer -> GPU")),
+        engine=SimpleNamespace(resume=lambda: calls.append("server up"), pause=lambda: calls.append("server down")))
+    Trainer._rollout_phase(stub)
+    Trainer._train_phase(stub)
+    assert calls == ["trainer -> RAM", "server up", "server down", "trainer -> GPU"]
+    stub.policy.offload = lambda: False          # e.g. bitsandbytes can't move this model
+    Trainer._rollout_phase(stub)
+    assert stub.offload_trainer is False         # gives up offloading instead of crashing
+
+
+def test_sync_adapters_can_leave_server_stopped(tmp_path, monkeypatch):
+    import adv.engines.llamacpp as L
+    monkeypatch.setattr(L, "convert_adapter_to_gguf", lambda src, base, out, *a: Path(out).write_text("gguf"))
+    eng = L.LlamaCppEngine(None, "llama-server", "m.gguf", converter={"base_model_dir": ".", "script": "x"},
+                           adapter_gguf_dir=str(tmp_path), swap_during_training=True)
+    calls = []
+    eng.stop, eng.start = (lambda: calls.append("stop")), (lambda: calls.append("start"))
+    eng.sync_adapters({"maker": "a", "solver": "b"}, restart=False)
+    assert calls == ["stop"] and set(eng.adapter_files) == {"maker", "solver"}
+    eng.sync_adapters({"maker": "a", "solver": "b"})
+    assert calls == ["stop", "stop", "start"]

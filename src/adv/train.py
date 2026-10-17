@@ -126,7 +126,8 @@ class Trainer:
             if self.engine_name == "llamacpp" and st.get("lora_targets") == "mlp_only":
                 cfg["lora"]["target_modules"] = "mlp_only"  # what the self-test found llama.cpp accepts
             self.policy = Policy(str(train_dir), cfg["lora"], cfg["optim"], prof["quant_4bit"], prof["dtype"], device,
-                                 trust_remote_code=trust)
+                                 trust_remote_code=trust, optimizer=prof.get("optimizer", "adamw"),
+                                 offload_activations=bool(prof.get("offload_activations", False)))
             self.model_name = prof["train_repo"].split("/")[-1]
             if self.engine_name == "llamacpp":
                 from .engines.llamacpp import LlamaCppEngine
@@ -174,6 +175,8 @@ class Trainer:
             else:
                 print("WARNING: Pi (node + pi-coding-agent) not found; falling back to single-shot solver")
         self.harness = "pi" if self.pi else "single-shot"
+        # 24 GB GPUs can't hold the 27B trainer and its GGUF at once: park the trainer in RAM during rollouts
+        self.offload_trainer = (self.engine_name == "llamacpp" and bool(self.prof.get("offload_trainer_during_rollouts")))
         self.referee = self._pick_referee()
         self.seeds = load_seed_puzzles(C.ROOT / "data" / "seed_puzzles.jsonl", cfg["sandbox"]["timeout_s"])
 
@@ -263,7 +266,7 @@ class Trainer:
         g = cfg["grpo"]
         t0 = time.monotonic()
         self.params["maker"].temperature = knobs["maker_temperature"]
-        self.engine.resume()
+        self._rollout_phase()
 
         # 1-2. Maker writes puzzles; sandbox validates
         jobs = [maker_messages(pick_topic(self.rng), knobs["difficulty"], self.rng.sample(self.seeds, 2), self.titles)
@@ -299,7 +302,7 @@ class Trainer:
                          for m, adv, r in zip(makers, m_adv, maker_rewards) for ids, mask in m.rollout.sequences()]
 
         t1 = time.monotonic()
-        self.engine.pause()
+        self._train_phase()
         kw = dict(grad_clip=cfg["optim"]["grad_clip"], max_seq_len=self.prof["max_seq_len"], ppo_epochs=g["ppo_epochs"],
                   clip_eps=g["clip_eps"], kl_beta=g["kl_beta"], lr_scale=knobs["lr_scale"])
         s_st = self.policy.train_step("solver", solver_samples, **kw)
@@ -356,6 +359,17 @@ class Trainer:
                 "statement": m.puzzle.statement, "attempt": best.code if best else None,
                 "attempt_score": best.test_frac if best else 0.0}
 
+    def _rollout_phase(self):
+        """GPU belongs to llama.cpp: optionally move the trainer to RAM, then make sure the server runs."""
+        if self.offload_trainer and not self.policy.offload():
+            self.offload_trainer = False  # couldn't move it; llama.cpp then fits what it can (-ngl auto)
+        self.engine.resume()
+
+    def _train_phase(self):
+        """GPU belongs to the trainer: stop llama-server (swap profiles) and bring the weights back."""
+        self.engine.pause()
+        self.policy.onload()
+
     def _sync_engine(self):
         """Push the freshly trained adapters into the rollout engine."""
         if self.engine_name != "llamacpp":
@@ -366,7 +380,8 @@ class Trainer:
         raw = self.policy.save(export / "raw", with_optimizer=False)
         dirs = {n: export_for_llamacpp(d, str(C.repo_dir(self.prof["train_repo"])), str(export / n))
                 for n, d in raw.items()}
-        self.engine.sync_adapters(dirs)
+        # swap profiles: the server is (re)started by the next rollout phase, after the trainer left the GPU
+        self.engine.sync_adapters(dirs, restart=not self.prof.get("swap_engine_during_training", False))
 
     # ------------------------------------------------------------------ checkpoints
     def save_checkpoint(self, step: int):
@@ -494,7 +509,7 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true", help="fake model: tests the whole pipeline in minutes")
     ap.add_argument("--steps", type=int, help="override run.total_steps")
     ap.add_argument("--max-hours", type=float, default=None)
-    ap.add_argument("--profile", choices=["cuda_large", "lawson_b131", "cuda_small", "cpu", "cpu_small", "cpu_tiny"])
+    ap.add_argument("--profile", choices=["cuda_large", "cuda_mid", "cuda_small", "cpu", "cpu_small", "cpu_tiny"])
     ap.add_argument("--name", help="override run.name")
     ap.add_argument("--no-pi", action="store_true", help="single-shot solver instead of Pi")
     ap.add_argument("--pi-node", help="path to node (default: tools/node)")

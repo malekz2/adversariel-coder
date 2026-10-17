@@ -35,10 +35,14 @@ def _chunk_logprobs(h: torch.Tensor, targets: torch.Tensor, weight: torch.Tensor
 class Policy:
     def __init__(self, model_dir: str, lora_cfg: dict, optim_cfg: dict, quant_4bit: bool = False,
                  dtype: str = "bfloat16", device: str = "cpu", gradient_checkpointing: bool = True,
-                 logit_chunk: int = 512, trust_remote_code: bool = False):
+                 logit_chunk: int = 512, trust_remote_code: bool = False, optimizer: str = "adamw",
+                 offload_activations: bool = False):
         from peft import LoraConfig, get_peft_model
         self.device = torch.device(device)
+        self.home = self.device            # where the weights live while training
         self.logit_chunk = logit_chunk
+        self.optimizer_name = optimizer
+        self.offload_activations = offload_activations and self.device.type == "cuda"
         self.model_dir = model_dir
         torch_dtype = getattr(torch, dtype)
         kwargs = {"dtype": torch_dtype, "low_cpu_mem_usage": True, "trust_remote_code": trust_remote_code}
@@ -74,13 +78,43 @@ class Policy:
             for p in ps:
                 p.data = p.data.float()  # keep trainable LoRA weights in fp32
             self.params[name] = ps
-        self.opt = {n: torch.optim.AdamW(ps, lr=self.lr[n], betas=(0.9, 0.99), weight_decay=self.weight_decay)
-                    for n, ps in self.params.items()}
+        self.opt = {n: self._make_optimizer(n) for n in self.params}
         # fp16 (GPUs without bf16, e.g. RTX 20xx): scale the loss so small gradients don't round to zero
         self.scaler = ({n: torch.amp.GradScaler(self.device.type) for n in self.params}
                        if torch_dtype == torch.float16 else None)
         self.active = None
         self.use_adapter("solver")
+
+    def _make_optimizer(self, name: str):
+        ps = self.params[name]
+        if self.optimizer_name == "paged_adamw_8bit" and self.device.type == "cuda":
+            try:  # QLoRA's paged 8-bit Adam: ~4x smaller optimizer state, spills to RAM on memory spikes
+                import bitsandbytes as bnb
+                return bnb.optim.PagedAdamW8bit(ps, lr=self.lr[name], betas=(0.9, 0.99), weight_decay=self.weight_decay)
+            except Exception as e:
+                print(f"paged 8-bit AdamW unavailable ({e}); using torch AdamW")
+        return torch.optim.AdamW(ps, lr=self.lr[name], betas=(0.9, 0.99), weight_decay=self.weight_decay)
+
+    # ------------------------------------------------------------ GPU <-> RAM (rollout phase)
+    def offload(self) -> bool:
+        """Move the weights to system RAM so llama.cpp can use the whole GPU for rollouts.
+        Returns False (and stays on the GPU) if this model/bitsandbytes combination can't be moved."""
+        if self.device.type != "cuda":
+            return False
+        try:
+            self.model.get_base_model().to("cpu")
+        except Exception as e:
+            print(f"WARNING: could not move the trainer to RAM ({e}); it stays on the GPU")
+            self.model.get_base_model().to(self.home)
+            return False
+        self.device = torch.device("cpu")
+        torch.cuda.empty_cache()
+        return True
+
+    def onload(self):
+        if self.device != self.home:
+            self.model.get_base_model().to(self.home)
+            self.device = self.home
 
     @staticmethod
     def _load(model_dir, kwargs):
@@ -115,7 +149,12 @@ class Policy:
         vocabulary never materialises for the whole sequence at once."""
         body, head = self._body_and_head()
         ids = torch.tensor([input_ids], dtype=torch.long, device=self.device)
-        h = body(input_ids=ids).last_hidden_state[0]
+        if self.offload_activations and torch.is_grad_enabled():
+            # keep the activations saved for backward in pinned system RAM instead of VRAM
+            with torch.autograd.graph.save_on_cpu(pin_memory=torch.cuda.is_available()):
+                h = body(input_ids=ids).last_hidden_state[0]
+        else:
+            h = body(input_ids=ids).last_hidden_state[0]
         hs = h[start - 1:len(input_ids) - 1]
         tgt = ids[0, start:]
         w = head.weight
@@ -128,6 +167,7 @@ class Policy:
     # ------------------------------------------------------------ GRPO update
     def train_step(self, role: str, samples: list[Sample], grad_clip: float = 1.0, max_seq_len: int = 8192,
                    ppo_epochs: int = 1, clip_eps: float = 0.2, kl_beta: float = 0.0, lr_scale: float = 1.0) -> dict:
+        self.onload()
         self.use_adapter(role)
         self.model.train()
         opt = self.opt[role]
@@ -208,8 +248,7 @@ class Policy:
             if with_optimizer and (d / "optimizer.pt").exists():
                 self.opt[name].load_state_dict(torch.load(d / "optimizer.pt", map_location=self.device))
             elif not with_optimizer:  # fresh optimizer moments after a reset
-                self.opt[name] = torch.optim.AdamW(self.params[name], lr=self.lr[name], betas=(0.9, 0.99),
-                                                   weight_decay=self.weight_decay)
+                self.opt[name] = self._make_optimizer(name)
 
 
 def base_checkpoint_prefix(base_dir: str) -> str:
@@ -264,6 +303,12 @@ class MockPolicy:
 
     def num_trainable(self):
         return {"solver": 0, "maker": 0}
+
+    def offload(self):
+        return False
+
+    def onload(self):
+        pass
 
     def use_adapter(self, name):
         pass
