@@ -1,0 +1,11 @@
+tools/
+.venv/
+models/
+runs/
+state/
+log.txt
+train.png
+__pycache__/
+.pytest_cache/
+._*
+.DS_Store

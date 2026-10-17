@@ -1,0 +1,145 @@
+# Adversarial Maker <-> Solver: all settings live here.
+# Anything you pass on the command line (e.g. --steps 50) overrides these values.
+
+run:
+  name: run1                 # outputs go to runs/<name>/  (log.txt and train.png are written to the project folder too)
+  total_steps: 200           # one step = Maker writes puzzles -> Solver attempts them -> both adapters update once
+  log_every: 1               # overwrite log.txt + train.png every N steps
+  checkpoint_every: 5        # save adapters + optimiser + state every N steps (resume picks the latest)
+  keep_checkpoints: 3
+  max_hours: 0               # stop cleanly after this many hours (0 = no limit). Handy for lab sessions.
+  seed: 0
+
+# auto = check_hardware decides (cuda_large / cuda_small / cpu / cpu_tiny); or force one of them
+profile: auto
+
+profiles:
+  cuda_large:                # NVIDIA GPU with >= 24 GB: the real experiment
+    train_repo: unsloth/Qwen3.8-27B            # BF16 safetensors, quantised to 4-bit NF4 while loading (QLoRA)
+    gguf_repo: unsloth/Qwen3.8-27B-GGUF
+    gguf_file: Qwen3.8-27B-UD-IQ4_XS.gguf     # your chosen rollout quant
+    quant_4bit: true
+    dtype: bfloat16
+    llama_build: cuda
+    llama_gpu_layers: all
+    parallel_slots: 4
+    swap_engine_during_training: true          # stop llama-server while training so both fit in VRAM
+    max_seq_len: 12288
+    ctx_per_slot: 12288
+  cuda_small:                # NVIDIA GPU with 8-24 GB
+    train_repo: unsloth/Qwen3.5-4B
+    gguf_repo: unsloth/Qwen3.5-4B-GGUF
+    gguf_file: Qwen3.5-4B-Q4_K_M.gguf
+    quant_4bit: true
+    dtype: bfloat16
+    llama_build: cuda
+    llama_gpu_layers: all
+    parallel_slots: 4
+    swap_engine_during_training: true
+    max_seq_len: 10240
+    ctx_per_slot: 10240
+  cpu:                       # no NVIDIA GPU, >= 24 GB RAM (e.g. the OptiPlex with 32 GB)
+    train_repo: unsloth/Qwen3.5-2B
+    gguf_repo: unsloth/Qwen3.5-2B-GGUF
+    gguf_file: Qwen3.5-2B-Q4_K_M.gguf
+    quant_4bit: false        # bitsandbytes 4-bit needs CUDA, so plain LoRA in fp32
+    dtype: float32           # 12th-gen Intel CPUs have no fast bf16
+    llama_build: cpu
+    llama_gpu_layers: 0
+    parallel_slots: 4
+    swap_engine_during_training: false
+    max_seq_len: 8192
+    ctx_per_slot: 8192
+  cpu_tiny:                  # no GPU and < 24 GB RAM, or when you want faster steps on CPU
+    train_repo: unsloth/Qwen3.5-0.8B
+    gguf_repo: unsloth/Qwen3.5-0.8B-GGUF
+    gguf_file: Qwen3.5-0.8B-Q4_K_M.gguf
+    quant_4bit: false
+    dtype: float32
+    llama_build: cpu
+    llama_gpu_layers: 0
+    parallel_slots: 4
+    swap_engine_during_training: false
+    max_seq_len: 8192
+    ctx_per_slot: 8192
+
+engine: auto                 # auto = use setup's self-test result; llamacpp | hf
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.0
+  use_rslora: true
+  target_modules: all        # all = attention + Gated-DeltaNet projections + MLP; mlp_only if llama.cpp rejects the rest
+
+optim:
+  lr_solver: 2.0e-5          # LoRA RL learning rates are ~10x higher than full fine-tuning
+  lr_maker: 1.0e-5
+  weight_decay: 0.0
+  grad_clip: 1.0
+
+grpo:
+  puzzles_per_step: 4        # M: how many puzzles the Maker writes each step
+  solver_attempts: 4         # G: Solver attempts per puzzle = GRPO group size (p_hat in {0, .25, .5, .75, 1})
+  ppo_epochs: 1              # 1 = purely on-policy (ratio is always 1); >1 enables PPO clipping
+  clip_eps: 0.2
+  kl_beta: 0.0               # >0 adds a KL penalty to the frozen base (adapters off). 0 like DAPO/Dr.GRPO
+  scale_by_std: true
+  maker_baseline: batch      # the Maker has no natural group, so its baseline is the step's batch mean
+
+generation:
+  enable_thinking: true
+  reasoning_effort: low      # Qwen3.8 only (xhigh | medium | low); ignored by Qwen3.5
+  maker:
+    temperature: 1.0
+    top_p: 0.95
+    top_k: 20
+    think_budget: 1024
+    max_new_tokens: 3072
+  solver:
+    temperature: 0.8
+    top_p: 0.95
+    top_k: 20
+    think_budget: 768
+    max_new_tokens: 2048     # per turn
+
+overthinking_bias:
+  enabled: true
+  roles: [maker, solver]
+  scope: thinking            # only inside <think>; " or" / " error" are everywhere in real code
+  file: data/overthinking_markers.json
+
+solver:
+  use_pi: true               # false = single-shot answer in a ```python block (much faster)
+  pi_tools: read,write,edit,bash
+  max_turns: 6               # model calls per attempt before the proxy ends the episode
+  timeout_s: 900
+  visible_tests: 3           # examples shown in PROBLEM.md; grading uses all tests
+
+sandbox:
+  timeout_s: 10
+  max_memory_mb: 2048
+
+rewards:
+  maker_invalid: -1.0
+  similarity_penalty: 0.5
+  similarity_free: 0.3       # puzzles less similar than this to recent ones are not penalised
+  full_pass_bonus: 0.5
+
+decision:
+  every: 10                  # consult the referee every N steps
+  backend: auto              # auto = d3-flash if its GGUF is present and RAM allows, else rules; d3 | rules
+  d3_repo: ggml-org/vllm-d3-flash-GGUF
+  d3_file: vllm-d3-flash-Q4_K_M.gguf
+  gpu_layers: 0              # run d3 on CPU so it never competes with training for VRAM
+  keep_loaded: false
+  stall_threshold: 0.6       # act only if P(stalled) >= this
+  cooldown_steps: 15         # at least this many steps between two interventions
+  inject_steps: 5
+  start_difficulty: 2
+  maker_temperature: 1.0
+
+ports:
+  engine: 8181
+  proxy: 8282
+  d3: 8383
