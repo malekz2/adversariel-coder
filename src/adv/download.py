@@ -9,7 +9,7 @@ from pathlib import Path
 
 from . import config as C
 
-TRAIN_PATTERNS = ["*.json", "*.safetensors", "*.jinja", "*.txt", "*.model", "*.tiktoken"]
+TRAIN_PATTERNS = ["*.json", "*.safetensors", "*.jinja", "*.txt", "*.model", "*.tiktoken", "*.py"]  # .py: custom model code
 
 
 def plan(cfg: dict, profile: str, with_d3: bool = True) -> list[dict]:

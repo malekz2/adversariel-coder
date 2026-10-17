@@ -34,7 +34,9 @@ def convert_adapter_to_gguf(peft_dir: str, base_model_dir: str, out_file: str, c
         env["PYTHONPATH"] = gguf_py + os.pathsep + env.get("PYTHONPATH", "")
     cmd = [python or sys.executable, convert_script, "--base", base_model_dir, "--outtype", "f16",
            "--outfile", out_file, peft_dir]
-    r = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    # stdin=DEVNULL: for models with custom code (K2-Horizon) the converter asks "run the custom code? [y/N]";
+    # with no input it takes the default and continues instead of waiting forever.
+    r = subprocess.run(cmd, env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL)
     if r.returncode != 0 or not Path(out_file).exists():
         raise RuntimeError(f"LoRA->GGUF conversion failed:\n{r.stdout[-2000:]}\n{r.stderr[-4000:]}")
     return out_file
@@ -163,25 +165,25 @@ class LlamaCppEngine(Engine):
         r.raise_for_status()
         return r.json()
 
-    def generate(self, prompt_ids, params: GenParams, in_thinking: bool) -> GenResult:
+    def generate(self, prompt_ids, params: GenParams, think_end: int | None) -> GenResult:
         tok = self.tok
         out, mask = [], []
         think_tokens, forced, markers = 0, False, 0
-        if in_thinking and tok.think_end is not None:
+        if think_end is not None:
             budget = max(1, min(params.think_budget, params.max_new_tokens))
-            r = self._complete(prompt_ids, budget, params, params.think_bias, ["</think>"])
+            r = self._complete(prompt_ids, budget, params, params.think_bias, [tok.decode([think_end])])
             toks = list(r.get("tokens") or [])
             stop_type = r.get("stop_type")
-            if tok.think_end in toks:                 # closed naturally (stop string not matched)
-                toks = toks[:toks.index(tok.think_end) + 1]
+            if think_end in toks:                     # closed naturally (stop string not matched)
+                toks = toks[:toks.index(think_end) + 1]
                 out, mask = toks, [1] * len(toks)
             elif stop_type == "word":                 # closed naturally, server cut the stop word
-                out, mask = toks + [tok.think_end], [1] * (len(toks) + 1)
+                out, mask = toks + [think_end], [1] * (len(toks) + 1)
             elif stop_type == "eos":                  # ended the whole answer inside <think>
                 out, mask = toks + [tok.im_end], [1] * (len(toks) + 1)
                 return GenResult(out, mask, "stop", len(toks), False, count_markers(toks, params.think_bias))
             else:                                     # budget exhausted: force the end of thinking
-                out, mask = toks + [tok.think_end], [1] * len(toks) + [0]
+                out, mask = toks + [think_end], [1] * len(toks) + [0]
                 forced = True
             think_tokens = len(out) - 1
             markers = count_markers(out, params.think_bias)

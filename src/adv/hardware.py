@@ -55,9 +55,15 @@ def pick_profile(info: dict) -> str:
     vram = (info.get("cuda_device") or {}).get("vram_gb", 0) if info.get("torch_cuda") else 0
     if vram >= 23.5:
         return "cuda_large"
+    gpu = ((info.get("cuda_device") or {}).get("name") or "").lower()
+    if 10 <= vram < 14 or "2080 ti" in gpu:   # e.g. Purdue LWSN B131's RTX 2080 Ti (11 GB)
+        return "lawson_b131"
     if vram >= 7.5:
         return "cuda_small"
-    return "cpu" if info.get("ram_gb", 0) >= 24 else "cpu_tiny"
+    ram = info.get("ram_gb", 0)
+    if ram >= 28:            # K2-Horizon-7B in bf16: 18 GB weights + training + rollout engine
+        return "cpu"
+    return "cpu_small" if ram >= 14 else "cpu_tiny"
 
 
 def main():

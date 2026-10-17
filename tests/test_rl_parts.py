@@ -8,6 +8,19 @@ from adv.logbook import ETA, atomic_write, fmt_dur, render_log
 from adv.rewards import learnability, maker_reward, solver_reward
 
 
+def test_hardware_profiles():
+    from adv.hardware import pick_profile
+    gpu = lambda name, gb: {"torch_cuda": True, "cuda_device": {"name": name, "vram_gb": gb}, "ram_gb": 16}  # noqa: E731
+    assert pick_profile(gpu("NVIDIA GeForce RTX 2080 Ti", 11.8)) == "lawson_b131"   # Purdue LWSN B131
+    assert pick_profile(gpu("NVIDIA GeForce RTX 3060", 12.9)) == "lawson_b131"
+    assert pick_profile(gpu("NVIDIA GeForce RTX 3070", 8.6)) == "cuda_small"
+    assert pick_profile(gpu("NVIDIA GeForce RTX 4060 Ti", 17.2)) == "cuda_small"
+    assert pick_profile(gpu("NVIDIA GeForce RTX 4090", 25.4)) == "cuda_large"
+    assert pick_profile({"ram_gb": 34.2}) == "cpu"            # OptiPlex 5000, 32 GB, no GPU
+    assert pick_profile({"ram_gb": 17.1}) == "cpu_small"      # Lawson Linux labs (16 GB, no GPU)
+    assert pick_profile({"ram_gb": 8.5}) == "cpu_tiny"
+
+
 def test_learnability_shape():
     assert learnability(0.5) == 1.0 and learnability(0) == 0 and learnability(1) == 0
     assert math.isclose(learnability(0.25), 0.5)

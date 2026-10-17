@@ -19,6 +19,16 @@ def test_parse_xml_tool_call_with_types():
     assert json.loads(calls[0]["function"]["arguments"]) == {"command": "python run_tests.py", "timeout": 30}
 
 
+def test_parse_k2_horizon_tool_call():
+    text = ("Running the tests.<ifm|tool_calls>\n<ifm|tool_call>bash\n<ifm|arg_key>command</ifm|arg_key>\n"
+            "<ifm|arg_value>python run_tests.py</ifm|arg_value>\n<ifm|arg_key>timeout</ifm|arg_key>\n"
+            "<ifm|arg_value>30</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>")
+    content, calls = parse_tool_calls(text, TOOLS)
+    assert content == "Running the tests."
+    assert calls[0]["function"]["name"] == "bash"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"command": "python run_tests.py", "timeout": 30}
+
+
 def test_parse_json_tool_call_fallback():
     _, calls = parse_tool_calls('<tool_call>\n{"name": "bash", "arguments": {"command": "ls"}}\n</tool_call>', TOOLS)
     assert calls[0]["function"]["name"] == "bash"
@@ -39,7 +49,7 @@ class ScriptedEngine:
     def __init__(self, tok, texts):
         self.tok, self.texts = tok, list(texts)
 
-    def generate(self, prompt_ids, params, in_thinking):
+    def generate(self, prompt_ids, params, think_end):
         ids = self.tok.encode(self.texts.pop(0)) + [self.tok.im_end]
         return GenResult(ids, [1] * len(ids), "stop", 3)
 
@@ -80,9 +90,9 @@ def test_proxy_turn_limit():
 def test_thinking_helpers():
     tok = MockTokenizer()
     ids = tok.encode(tok.render_text([{"role": "user", "content": "q"}], None, True))
-    assert thinking_open(tok, ids)
+    assert thinking_open(tok, ids) == tok.think_end
     gen = tok.encode("reason</think>\n\nanswer") + [tok.im_end]
-    assert split_completion(tok, gen, True) == ("reason", "answer")
+    assert split_completion(tok, gen, tok.think_end) == ("reason", "answer")
 
 
 def test_thinking_only_bias_processor():

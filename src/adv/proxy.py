@@ -112,7 +112,7 @@ class RecordingProxy:
         last_asst = max((i for i, m in enumerate(msgs) if m["role"] == "assistant"), default=None)
         if ro.seq_ids is not None and last_asst is not None:
             core = tok.render_text(msgs[:last_asst + 1], tools, add_generation_prompt=False).rstrip("\n")
-            if core.endswith("<|im_end|>") and full_text.startswith(core):
+            if core.endswith(tok.im_end_text) and full_text.startswith(core):
                 base, base_mask = list(ro.seq_ids), list(ro.seq_mask)
                 if base[-1] not in tok.stop_ids:          # previous turn was cut off at max tokens
                     base.append(tok.im_end)
@@ -132,8 +132,8 @@ class RecordingProxy:
 
         params = copy.copy(self.params[ro.role])
         params.max_new_tokens = min(params.max_new_tokens, room, max_tokens or 10**9)
-        in_think = thinking_open(tok, prompt_ids)
-        gen = self.engine.generate(prompt_ids, params, in_think)
+        think_end = thinking_open(tok, prompt_ids)   # which tag closes the thinking (model-specific)
+        gen = self.engine.generate(prompt_ids, params, think_end)
 
         # record (and chain) the sequence
         if chained:
@@ -145,7 +145,7 @@ class RecordingProxy:
             ro.seq_ids = prompt_ids + gen.token_ids
             ro.seq_mask = delta_mask_prefix + gen.loss_mask
 
-        reasoning, answer = split_completion(tok, gen.token_ids, in_think)
+        reasoning, answer = split_completion(tok, gen.token_ids, think_end)
         content, calls = parse_tool_calls(answer, tools) if tools else (answer, [])
         ro.turns.append(Turn(len(prompt_ids), gen, chained, reasoning, content, calls))
         finish = "tool_calls" if calls else ("length" if gen.finish_reason == "length" else "stop")

@@ -154,7 +154,8 @@ def render_log(*, cfg: dict, header: dict, history: list[dict], eta: ETA, starte
              f"dead groups {_f(last.get('dead_group_frac'))}")
     L.append(f"maker:  loss {_f(last.get('maker_loss'), 4)} grad-norm {_f(last.get('maker_grad_norm'), 3)} "
              f"samples {last.get('maker_samples', 0)} tokens {last.get('maker_tokens', 0)}   "
-             f"skipped (too long) {last.get('skipped_long', 0)}")
+             f"skipped (too long) {last.get('skipped_long', 0)}   "
+             f"overflow-skipped updates {(last.get('solver_nonfinite_grads') or 0) + (last.get('maker_nonfinite_grads') or 0)}")
     L.append(f"knobs: difficulty {last.get('knob_difficulty')}  maker temp {last.get('knob_maker_temperature')}  "
              f"lr scale {last.get('knob_lr_scale')}  seed-injection steps left {last.get('knob_inject_seeds_steps')}")
     L.append("--- REFEREE " + "-" * 59)

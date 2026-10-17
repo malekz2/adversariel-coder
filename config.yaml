@@ -10,7 +10,7 @@ run:
   max_hours: 0               # stop cleanly after this many hours (0 = no limit). Handy for lab sessions.
   seed: 0
 
-# auto = check_hardware decides (cuda_large / cuda_small / cpu / cpu_tiny); or force one of them
+# auto = check_hardware decides (cuda_large / cuda_small / cpu / cpu_small / cpu_tiny); or force one of them
 profile: auto
 
 profiles:
@@ -26,7 +26,21 @@ profiles:
     swap_engine_during_training: true          # stop llama-server while training so both fit in VRAM
     max_seq_len: 12288
     ctx_per_slot: 12288
-  cuda_small:                # NVIDIA GPU with 8-24 GB
+  lawson_b131:               # Purdue LWSN B131: RTX 2080 Ti (11 GB VRAM), 16 GB RAM, 4-core Xeon, Windows 10
+    train_repo: IFM/K2-Horizon-3.7B           # same family / chat format as the cpu profile's K2-Horizon-7B
+    gguf_repo: IFM/K2-Horizon-3.7B-GGUF
+    gguf_file: K2-Horizon-4B-Q4_K_M.gguf      # (IFM names the 3.7B GGUF files "4B")
+    trust_remote_code: true
+    reasoning_effort: low
+    quant_4bit: true         # QLoRA: ~1.9 GB of 4-bit layers + ~2.6 GB of 16-bit embeddings/output layer
+    dtype: float16           # Turing (RTX 20xx) has no native bf16; fp16 + loss scaling instead
+    llama_build: cuda
+    llama_gpu_layers: auto   # llama.cpp fits as many layers as free VRAM allows (the trainer also lives there)
+    parallel_slots: 2
+    swap_engine_during_training: true          # stop llama-server while training to give activations room
+    max_seq_len: 6144
+    ctx_per_slot: 6144
+  cuda_small:                # NVIDIA GPU with 8-10 GB or 14-24 GB
     train_repo: unsloth/Qwen3.5-4B
     gguf_repo: unsloth/Qwen3.5-4B-GGUF
     gguf_file: Qwen3.5-4B-Q4_K_M.gguf
@@ -38,11 +52,25 @@ profiles:
     swap_engine_during_training: true
     max_seq_len: 10240
     ctx_per_slot: 10240
-  cpu:                       # no NVIDIA GPU, >= 24 GB RAM (e.g. the OptiPlex with 32 GB)
+  cpu:                       # no NVIDIA GPU, >= 28 GB RAM (e.g. the OptiPlex with 32 GB): K2-Horizon-7B
+    train_repo: IFM/K2-Horizon-7B             # dense 7B, ships its own model code (trust_remote_code)
+    gguf_repo: IFM/K2-Horizon-7B-GGUF
+    gguf_file: K2-Horizon-7B-Q4_K_M.gguf
+    trust_remote_code: true
+    reasoning_effort: low    # K2: high/medium/low -> <ifm|think>/<ifm|think_fast>/<ifm|think_faster>; low keeps CPU steps shorter
+    quant_4bit: false        # bitsandbytes 4-bit needs CUDA, so plain LoRA
+    dtype: bfloat16          # fp32 would need 36 GB for the weights alone; bf16 is 18 GB
+    llama_build: cpu
+    llama_gpu_layers: 0
+    parallel_slots: 2
+    swap_engine_during_training: true          # stop llama-server while training to free ~6 GB of RAM
+    max_seq_len: 8192
+    ctx_per_slot: 8192
+  cpu_small:                 # no NVIDIA GPU, 14-28 GB RAM, or when K2-Horizon-7B steps are too slow
     train_repo: unsloth/Qwen3.5-2B
     gguf_repo: unsloth/Qwen3.5-2B-GGUF
     gguf_file: Qwen3.5-2B-Q4_K_M.gguf
-    quant_4bit: false        # bitsandbytes 4-bit needs CUDA, so plain LoRA in fp32
+    quant_4bit: false
     dtype: float32           # 12th-gen Intel CPUs have no fast bf16
     llama_build: cpu
     llama_gpu_layers: 0
@@ -50,7 +78,7 @@ profiles:
     swap_engine_during_training: false
     max_seq_len: 8192
     ctx_per_slot: 8192
-  cpu_tiny:                  # no GPU and < 24 GB RAM, or when you want faster steps on CPU
+  cpu_tiny:                  # no GPU and < 14 GB RAM, or when you want the fastest steps on CPU
     train_repo: unsloth/Qwen3.5-0.8B
     gguf_repo: unsloth/Qwen3.5-0.8B-GGUF
     gguf_file: Qwen3.5-0.8B-Q4_K_M.gguf
@@ -89,7 +117,7 @@ grpo:
 
 generation:
   enable_thinking: true
-  reasoning_effort: low      # Qwen3.8 only (xhigh | medium | low); ignored by Qwen3.5
+  reasoning_effort: low      # Qwen3.8: xhigh|medium|low, K2-Horizon: high|medium|low, ignored by Qwen3.5 (a profile can override)
   maker:
     temperature: 1.0
     top_p: 0.95

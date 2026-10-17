@@ -54,7 +54,7 @@ class HFEngine(Engine):
         self.policy = policy
         self.lock = threading.Lock()
 
-    def generate(self, prompt_ids, params: GenParams, in_thinking: bool) -> GenResult:
+    def generate(self, prompt_ids, params: GenParams, think_end: int | None) -> GenResult:
         tok, model = self.tok, self.policy.model
         with self.lock, torch.no_grad():
             self.policy.use_adapter(params.adapter)
@@ -62,8 +62,8 @@ class HFEngine(Engine):
             model.eval()
             device = self.policy.device
             inp = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-            proc = ThinkingOnlyBias(len(prompt_ids), tok.think_end, params.think_bias,
-                                    min(params.think_budget, params.max_new_tokens), in_thinking, device)
+            proc = ThinkingOnlyBias(len(prompt_ids), think_end, params.think_bias,
+                                    min(params.think_budget, params.max_new_tokens), think_end is not None, device)
             gen_kwargs = dict(max_new_tokens=params.max_new_tokens, logits_processor=LogitsProcessorList([proc]),
                               eos_token_id=sorted(tok.stop_ids), pad_token_id=sorted(tok.stop_ids)[0],
                               use_cache=True)
@@ -87,7 +87,7 @@ class HFEngine(Engine):
             mask[proc.forced_at] = 0
         finish = "stop" if gen and gen[-1] in tok.stop_ids else "length"
         think = 0
-        if in_thinking:
-            think = gen.index(tok.think_end) if tok.think_end in gen else len(gen)
+        if think_end is not None:
+            think = gen.index(think_end) if think_end in gen else len(gen)
         return GenResult(gen, mask, finish, think, proc.forced_at is not None,
                          count_markers(gen[:think], params.think_bias))

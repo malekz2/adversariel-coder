@@ -1,7 +1,7 @@
-"""Real-architecture plumbing on a miniature random Qwen3.5 (no optimiser steps: nothing is trained).
+"""Real-architecture plumbing on a miniature random model (no optimiser steps: nothing is trained).
 
-Opt-in:  ADV_TINY_SRC=<dir with Qwen3.5 config.json + tokenizer files> pytest tests/test_tiny_model.py
-On the lab PC after setup:  ADV_TINY_SRC=<models>/unsloth__Qwen3.5-2B
+Opt-in:  ADV_TINY_SRC=<dir with config.json + tokenizer files (+ .py code)> pytest tests/test_tiny_model.py
+Works for Qwen3.5 (e.g. <models>/unsloth__Qwen3.5-2B) and K2-Horizon (<models>/IFM__K2-Horizon-7B).
 """
 import os
 import re
@@ -22,16 +22,19 @@ def tiny(tmp_path_factory):
 @pytest.fixture(scope="module")
 def policy(tiny):
     from adv.policy import Policy
-    return Policy(tiny, {"r": 4, "alpha": 8}, {}, dtype="float32", device="cpu")
+    return Policy(tiny, {"r": 4, "alpha": 8}, {}, dtype="float32", device="cpu", trust_remote_code=True)
 
 
 def test_lora_targets_and_text_only_load(policy):
-    assert type(policy.model.get_base_model()).__name__ == "Qwen3_5ForCausalLM"
+    name = type(policy.model.get_base_model()).__name__
+    assert name in ("Qwen3_5ForCausalLM", "K2HorizonForCausalLM")
     mods = {re.sub(r".*layers\.\d+\.", "", n.split(".lora_")[0]) for n, _ in policy.model.named_parameters()
             if "lora_A.solver" in n}
-    assert mods == {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
-                    "linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.out_proj",
-                    "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"}
+    want = {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+            "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"}
+    if name.startswith("Qwen3_5"):  # hybrid model: Gated-DeltaNet layers too
+        want |= {"linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.out_proj"}
+    assert mods == want
 
 
 def test_chunked_logprobs_match_full_forward_and_grads_hit_only_active_adapter(policy, tiny):
@@ -56,11 +59,12 @@ def test_hf_engine_think_budget(policy, tiny):
     from adv.engines.base import GenParams
     from adv.engines.hf import HFEngine
     from adv.tokenizer import ChatTokenizer, thinking_open
-    tok = ChatTokenizer(tiny)
+    tok = ChatTokenizer(tiny, reasoning_effort="low", trust_remote_code=True)
     ids = tok.encode(tok.render_text([{"role": "user", "content": "hi"}], None, True))
-    assert thinking_open(tok, ids)
-    r = HFEngine(tok, policy).generate(ids, GenParams("maker", max_new_tokens=20, think_budget=5), True)
-    assert r.token_ids[5] == tok.think_end and r.loss_mask[5] == 0 and r.forced_think_end
+    end = thinking_open(tok, ids)
+    assert end is not None and end in tok.think_pairs.values()
+    r = HFEngine(tok, policy).generate(ids, GenParams("maker", max_new_tokens=20, think_budget=5), end)
+    assert r.token_ids[5] == end and r.loss_mask[5] == 0 and r.forced_think_end
 
 
 def test_export_renames_and_rescales_rslora(policy, tiny, tmp_path):
@@ -70,6 +74,8 @@ def test_export_renames_and_rescales_rslora(policy, tiny, tmp_path):
     dirs = policy.save(tmp_path / "ck", with_optimizer=False)
     out = export_for_llamacpp(dirs["solver"], tiny, str(tmp_path / "ex"))
     with safe_open(out + "/adapter_model.safetensors", "pt") as s:
-        assert all(".language_model.layers." in k for k in s.keys())
+        from adv.policy import base_checkpoint_prefix
+        prefix = base_checkpoint_prefix(tiny)
+        assert all(("base_model.model." + prefix) in k for k in s.keys())
     cfg = json.loads(open(out + "/adapter_config.json").read())
     assert cfg["lora_alpha"] == 8 * 2 and cfg["use_rslora"] is False   # alpha * sqrt(r=4)

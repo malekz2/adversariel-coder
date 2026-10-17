@@ -14,19 +14,44 @@ import uuid
 TOOL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.S)
 FUNC_RE = re.compile(r"<function=([^>\s]+)>\s*(.*?)\s*</function>", re.S)
 PARAM_RE = re.compile(r"<parameter=([^>\s]+)>\n?(.*?)\n?</parameter>", re.S)
+IFM_CALL_RE = re.compile(r"<ifm\|tool_call>\s*([^\s<]+)\s*(.*?)</ifm\|tool_call>", re.S)
+IFM_ARG_RE = re.compile(r"<ifm\|arg_key>(.*?)</ifm\|arg_key>\s*(?:<ifm\|arg_type>.*?</ifm\|arg_type>\s*)?"
+                        r"<ifm\|arg_value>(.*?)</ifm\|arg_value>", re.S)
+TOOL_START_MARKERS = ("<tool_call>", "<ifm|tool_calls>", "<ifm|tool_call>")
+
+# Chat formats differ per model family: end-of-turn token and thinking tags. The first format
+# whose end-of-turn marker is a single token in the vocabulary wins.
+CHAT_FORMATS = [
+    {"name": "qwen", "eot": "<|im_end|>", "think": [("<think>", "</think>")]},
+    {"name": "k2_horizon", "eot": "<|ifm|im_end|>",
+     # reasoning_effort high / medium / low opens <ifm|think> / <ifm|think_fast> / <ifm|think_faster>
+     "think": [("<ifm|think>", "</ifm|think>"), ("<ifm|think_fast>", "</ifm|think_fast>"),
+               ("<ifm|think_faster>", "</ifm|think_faster>")]},
+]
 
 
 class ChatTokenizer:
     """Wraps a Hugging Face tokenizer (the one shipped with the trained model)."""
 
-    def __init__(self, path: str, enable_thinking: bool = True, reasoning_effort: str | None = None):
+    def __init__(self, path: str, enable_thinking: bool = True, reasoning_effort: str | None = None,
+                 trust_remote_code: bool = False):
         from transformers import AutoTokenizer
-        self.tok = AutoTokenizer.from_pretrained(path)
+        # trust_remote_code: models with their own code (K2-Horizon) would otherwise stop and ask y/N
+        self.tok = AutoTokenizer.from_pretrained(path, trust_remote_code=trust_remote_code)
         self.enable_thinking = enable_thinking
         self.reasoning_effort = reasoning_effort
-        self.think_start = self._single_id("<think>")
-        self.think_end = self._single_id("</think>")
-        self.im_end = self._single_id("<|im_end|>")
+        fmt = next((f for f in CHAT_FORMATS if self._single_id(f["eot"]) is not None), None)
+        if fmt is None:
+            raise ValueError(f"unknown chat format for {path}: add its end-of-turn/thinking tokens to CHAT_FORMATS")
+        self.format = fmt["name"]
+        self.im_end_text = fmt["eot"]
+        self.im_end = self._single_id(fmt["eot"])
+        self.think_pairs = {}  # start-token id -> matching end-token id
+        for start, end in fmt["think"]:
+            a, b = self._single_id(start), self._single_id(end)
+            if a is not None and b is not None:
+                self.think_pairs[a] = b
+        self.think_start, self.think_end = next(iter(self.think_pairs.items()), (None, None))
         self.stop_ids = {i for i in (self.im_end, self.tok.eos_token_id) if i is not None}
 
     def _single_id(self, text: str):
@@ -62,9 +87,12 @@ class MockTokenizer:
         self.enable_thinking = enable_thinking
         self.sid = {s: self.BASE + i for i, s in enumerate(self.SPECIALS)}
         self.rev = {v: k for k, v in self.sid.items()}
+        self.format = "qwen"
         self.think_start = self.sid["<think>"]
         self.think_end = self.sid["</think>"]
+        self.think_pairs = {self.think_start: self.think_end}
         self.im_end = self.sid["<|im_end|>"]
+        self.im_end_text = "<|im_end|>"
         self.stop_ids = {self.im_end}
         self._split = re.compile("(" + "|".join(re.escape(s) for s in self.SPECIALS) + ")")
 
@@ -113,19 +141,20 @@ class MockTokenizer:
 
 # ------------------------------------------------------------------ helpers
 
-def thinking_open(tok, prompt_ids: list[int]) -> bool:
-    """True if the prompt ends inside an unfinished <think> block (generation starts thinking)."""
-    if tok.think_start is None:
-        return False
-    last_open = max((i for i, t in enumerate(prompt_ids[-64:]) if t == tok.think_start), default=None)
-    if last_open is None:
-        return False
-    tail = prompt_ids[-64:][last_open:]
-    return tok.think_end not in tail
+def thinking_open(tok, prompt_ids: list[int]) -> int | None:
+    """If the prompt ends inside an unfinished thinking block, return the token id that will close
+    it (e.g. </think>); otherwise None (generation starts with the answer)."""
+    ends = set(tok.think_pairs.values())
+    for t in reversed(prompt_ids[-64:]):
+        if t in tok.think_pairs:
+            return tok.think_pairs[t]
+        if t in ends:
+            return None
+    return None
 
 
 def normalize_messages(messages: list[dict]) -> list[dict]:
-    """OpenAI-style messages -> what the Qwen template expects."""
+    """OpenAI-style messages -> what Qwen / K2-Horizon chat templates expect."""
     out = []
     for m in messages:
         m = dict(m)
@@ -175,6 +204,10 @@ def parse_tool_calls(text: str, tools: list | None) -> tuple[str, list[dict]]:
     """Split assistant text into (content, OpenAI-style tool_calls)."""
     types = _param_types(tools)
     calls = []
+    for name, body in IFM_CALL_RE.findall(text):  # K2-Horizon: <ifm|tool_call>name <ifm|arg_key>..
+        args = {k.strip(): _coerce(v, types.get(name, {}).get(k.strip())) for k, v in IFM_ARG_RE.findall(body)}
+        calls.append({"id": "call_" + uuid.uuid4().hex[:12], "type": "function",
+                      "function": {"name": name, "arguments": json.dumps(args)}})
     for block in TOOL_BLOCK_RE.findall(text):
         fm = FUNC_RE.search(block)
         if fm:  # Qwen3.5 / Qwen3-Coder XML format
@@ -189,17 +222,18 @@ def parse_tool_calls(text: str, tools: list | None) -> tuple[str, list[dict]]:
         if name:
             calls.append({"id": "call_" + uuid.uuid4().hex[:12], "type": "function",
                           "function": {"name": name, "arguments": json.dumps(args)}})
-    first = text.find("<tool_call>")
-    content = (text[:first] if first != -1 else text).strip()
+    starts = [i for i in (text.find(m) for m in TOOL_START_MARKERS) if i != -1]
+    content = (text[:min(starts)] if starts else text).strip()
     return content, calls
 
 
-def split_completion(tok, completion_ids: list[int], started_in_thinking: bool) -> tuple[str, str]:
-    """Return (reasoning_text, answer_text) with stop tokens removed."""
+def split_completion(tok, completion_ids: list[int], think_end: int | None) -> tuple[str, str]:
+    """Return (reasoning_text, answer_text) with stop tokens removed. `think_end` is the token that
+    closes the thinking block the generation started in (None = it started with the answer)."""
     ids = [t for t in completion_ids if t not in tok.stop_ids]
-    if started_in_thinking and tok.think_end is not None and tok.think_end in ids:
-        k = ids.index(tok.think_end)
+    if think_end is not None and think_end in ids:
+        k = ids.index(think_end)
         return tok.decode(ids[:k]).strip(), tok.decode(ids[k + 1:]).strip()
-    if started_in_thinking:
+    if think_end is not None:
         return tok.decode(ids).strip(), ""  # never closed its thinking
     return "", tok.decode(ids).strip()

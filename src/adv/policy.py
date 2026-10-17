@@ -35,30 +35,27 @@ def _chunk_logprobs(h: torch.Tensor, targets: torch.Tensor, weight: torch.Tensor
 class Policy:
     def __init__(self, model_dir: str, lora_cfg: dict, optim_cfg: dict, quant_4bit: bool = False,
                  dtype: str = "bfloat16", device: str = "cpu", gradient_checkpointing: bool = True,
-                 logit_chunk: int = 512):
+                 logit_chunk: int = 512, trust_remote_code: bool = False):
         from peft import LoraConfig, get_peft_model
         self.device = torch.device(device)
         self.logit_chunk = logit_chunk
         self.model_dir = model_dir
         torch_dtype = getattr(torch, dtype)
-        kwargs = {"dtype": torch_dtype, "low_cpu_mem_usage": True}
+        kwargs = {"dtype": torch_dtype, "low_cpu_mem_usage": True, "trust_remote_code": trust_remote_code}
         if quant_4bit:
             from transformers import BitsAndBytesConfig
             kwargs["quantization_config"] = BitsAndBytesConfig(
                 load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
-                bnb_4bit_compute_dtype=torch.bfloat16)
+                bnb_4bit_compute_dtype=torch_dtype if torch_dtype in (torch.float16, torch.bfloat16) else torch.bfloat16)
         if self.device.type == "cuda":
             kwargs["device_map"] = {"": self.device.index or 0}
         base = self._load(model_dir, kwargs)
         if self.device.type != "cuda":
             base.to(self.device)
         base.config.use_cache = False
-        if quant_4bit:
-            from peft import prepare_model_for_kbit_training
-            base = prepare_model_for_kbit_training(
-                base, use_gradient_checkpointing=gradient_checkpointing,
-                gradient_checkpointing_kwargs={"use_reentrant": False})
-        elif gradient_checkpointing:
+        # Not peft.prepare_model_for_kbit_training: it upcasts every 16-bit weight to fp32, including the
+        # embedding and output layers, which for a 250k vocabulary costs GBs of VRAM (5 GB on K2-Horizon-3.7B).
+        if gradient_checkpointing:
             base.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
             base.enable_input_require_grads()
 
@@ -79,6 +76,9 @@ class Policy:
             self.params[name] = ps
         self.opt = {n: torch.optim.AdamW(ps, lr=self.lr[n], betas=(0.9, 0.99), weight_decay=self.weight_decay)
                     for n, ps in self.params.items()}
+        # fp16 (GPUs without bf16, e.g. RTX 20xx): scale the loss so small gradients don't round to zero
+        self.scaler = ({n: torch.amp.GradScaler(self.device.type) for n in self.params}
+                       if torch_dtype == torch.float16 else None)
         self.active = None
         self.use_adapter("solver")
 
@@ -158,13 +158,22 @@ class Policy:
                         ref = self.token_logprobs(s.input_ids, st)
                 loss_sum, st_ = policy_loss(lp, lp.detach() if old[i] is None else old[i], mask,
                                             s.advantage, clip_eps, ref, kl_beta)
-                (loss_sum / total).backward()
-                loss_total += float(loss_sum) / total
+                scaled = loss_sum / total
+                (self.scaler[role].scale(scaled) if self.scaler else scaled).backward()
+                loss_total += float(loss_sum.detach()) / total
                 clip_total += st_.get("clip_frac", 0.0) / len(usable)
                 kl_total += st_.get("kl", 0.0) / len(usable)
+            if self.scaler:
+                self.scaler[role].unscale_(opt)
             gn = torch.nn.utils.clip_grad_norm_(self.params[role], grad_clip)
-            opt.step()
-        stats.update(loss=loss_total, grad_norm=float(gn), clip_frac=clip_total, kl=kl_total)
+            if self.scaler:
+                self.scaler[role].step(opt)   # skips the step by itself if gradients overflowed
+                self.scaler[role].update()
+            elif torch.isfinite(gn):
+                opt.step()
+            stats["nonfinite_grads"] = stats.get("nonfinite_grads", 0) + int(not torch.isfinite(gn))
+        stats.update(loss=loss_total, grad_norm=float(gn) if torch.isfinite(gn) else None, clip_frac=clip_total,
+                     kl=kl_total)
         return stats
 
     # ------------------------------------------------------------ persistence

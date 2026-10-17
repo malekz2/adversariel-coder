@@ -80,23 +80,46 @@ read and which allows files over 4 GB.
 | profile | when | model trained (LoRA) | rollouts | rough time / step* |
 |---|---|---|---|---|
 | `cuda_large` | NVIDIA ≥ 24 GB VRAM | **Qwen3.8-27B**, 4-bit NF4 (QLoRA) | `Qwen3.8-27B-UD-IQ4_XS.gguf` | 15–30 min |
-| `cuda_small` | NVIDIA 8–24 GB | Qwen3.5-4B, NF4 | Qwen3.5-4B Q4_K_M | 5–15 min |
-| `cpu` | no NVIDIA, ≥ 24 GB RAM (OptiPlex with 32 GB) | Qwen3.5-2B, fp32 | Qwen3.5-2B Q4_K_M | **45–120 min** |
-| `cpu_tiny` | no NVIDIA, < 24 GB RAM | Qwen3.5-0.8B, fp32 | Qwen3.5-0.8B Q4_K_M | 20–45 min |
+| `lawson_b131` | NVIDIA 10–14 GB, e.g. **RTX 2080 Ti** (Purdue LWSN B131) | **K2-Horizon-3.7B**, NF4, fp16 | `K2-Horizon-4B-Q4_K_M.gguf` | 20–60 min |
+| `cuda_small` | NVIDIA 8–10 or 14–24 GB | Qwen3.5-4B, NF4 | Qwen3.5-4B Q4_K_M | 5–15 min |
+| `cpu` | **no NVIDIA, ≥ 28 GB RAM** (OptiPlex with 32 GB) | **K2-Horizon-7B**, bf16 | `K2-Horizon-7B-Q4_K_M.gguf` | **3–8 hours** |
+| `cpu_small` | no NVIDIA, 14–28 GB RAM | Qwen3.5-2B, fp32 | Qwen3.5-2B Q4_K_M | 45–120 min |
+| `cpu_tiny` | no NVIDIA, < 14 GB RAM | Qwen3.5-0.8B, fp32 | Qwen3.5-0.8B Q4_K_M | 20–45 min |
 
 \* Back-of-the-envelope estimates for the default settings (4 puzzles × 4 Pi attempts per step), not
 measurements. The **ETA in `log.txt` is the real number**; it settles after about 3 steps. Training is
 the slow part on CPU: every step back-propagates through ~50–100k tokens. To go faster, use `--no-pi`
-(shorter sequences, roughly 2–3× faster), `cpu_tiny`, or fewer `grpo.solver_attempts`.
+(shorter sequences, roughly 2–3× faster), `--profile cpu_small` / `cpu_tiny`, or fewer `grpo.solver_attempts`.
+
+**Purdue Lawson labs** (from the CS department's lab pages): only **LWSN B131** has a GPU, an
+**RTX 2080 Ti with 11 GB of VRAM**. Those PCs (Dell Precision 5810) have 16 GB of system RAM, a
+4-core Xeon E5-1603 and Windows 10. Setup picks `lawson_b131` there automatically: QLoRA on
+K2-Horizon-3.7B, the same model family and chat format as the CPU default. In 4-bit the trainer needs
+about 4.5 GB and the llama.cpp GGUF 3.2 GB, so both fit on the card, and llama-server pauses during
+training to give activations room. The 2080 Ti (Turing) has no native bf16, so training uses fp16 with
+loss scaling (a gradient scaler skips any step whose gradients overflow). Downloads ≈ 20 GB. The
+other Lawson labs (B146, B148, B158, B160) have no GPU and 16 GB of RAM: they get `cpu_small`
+(Qwen3.5-2B), since K2-Horizon-7B needs about 28 GB. Lab hardware changes, so `setup.bat` prints
+what it actually finds.
+
+**K2-Horizon-7B on CPU** (the default with no GPU): IFM's dense 7B, chosen for its strong coding and
+agentic scores. It has to train in bf16, because fp32 weights alone would be 36 GB, more than the PC's
+32 GB of RAM. The bf16 weights are 18 GB, and llama-server is paused during the training phase to free
+another ~6 GB. That leaves little headroom: close other programs. It is the slowest profile; if a step
+takes too long for your lab sessions, run `run.bat --profile cpu_small`. It uses its own chat format
+(`<ifm|think>` tags, `<ifm|tool_call>` tool calls) and its own model code (`trust_remote_code`);
+`src/adv/tokenizer.py` detects the format automatically. `reasoning_effort: low` makes it use its short
+`<ifm|think_faster>` thinking mode, to keep steps shorter.
 
 Why not 27B on a plain OptiPlex? A stock OptiPlex 5000 has a 12th-gen Intel CPU and integrated graphics.
 Generating with the 27B GGUF would run at about 2 tokens/s, and back-propagating through 27B on a CPU would
 take roughly half a day per step. The 4-bit training library (bitsandbytes) also needs an NVIDIA GPU.
 The code is identical across profiles, so a later run on a GPU machine uses the real 27B setup.
 
-**Disk:** tools + Python environment ≈ 3–6 GB on the card. Models: `cpu` ≈ 12.5 GB (fits on the card),
-`cpu_tiny` ≈ 9 GB, `cuda_small` ≈ 19 GB, `cuda_large` ≈ 76 GB (needs the PC's own drive). Some lab PCs
-wipe user folders at logout; if so, keep the models on the card or a USB drive.
+**Disk:** tools + Python environment ≈ 3–6 GB. Models (including the 6.6 GB d3-flash referee):
+`cpu` (K2-Horizon-7B) ≈ **30 GB**, `lawson_b131` (K2-Horizon-3.7B) ≈ 20 GB, `cpu_small` ≈ 12.5 GB, `cpu_tiny` ≈ 9 GB, `cuda_small` ≈ 19 GB,
+`cuda_large` ≈ 76 GB. Setup checks free space before downloading. Some lab PCs wipe user folders at
+logout; if so, keep the models on a USB drive.
 
 ---
 
@@ -172,9 +195,10 @@ The rollout id travels as Pi's API key. Hidden tests never exist on disk where P
 Your 49 marker words get a −2 logit bias, but **only inside `<think>`**: `" or"`, `" error"` and
 `" could"` are everywhere in real code. llama.cpp does it in two passes (biased until `</think>`, then
 unbiased); the HF engine uses a single-pass logits processor. If thinking hits its budget, `</think>` is
-forced, and that token is masked out of training. Your ids were checked and match the Qwen3.5/3.8
-tokenizer 49/49 (they would be wrong for Qwen3/Qwen2.5). They're still re-derived from the words at
-startup, so swapping models stays safe. Check any tokenizer with
+forced, and that token is masked out of training. Each model family has its own tags (K2-Horizon uses
+`<ifm|think>` / `<ifm|think_faster>`); the matching closing tag is found per request. Your ids match the
+Qwen3.5/3.8 tokenizer 49/49, but **0/49 for K2-Horizon** (a different vocabulary), so they are always
+re-derived from the words at startup. All 49 words are single tokens in both vocabularies. Check any tokenizer with
 `python -m adv.bias <folder with tokenizer.json>`. → `src/adv/bias.py`
 
 ### 4.8 The referee (d3-flash) and the controller
@@ -234,7 +258,9 @@ consulted (so it doesn't take memory from training).
   for that one process, which needs no admin rights.
 - **Out of memory:** lower `ctx_per_slot`/`max_seq_len` in the profile, set `parallel_slots: 2`, or use
   a smaller profile.
-- **Everything is slow:** see section 3. `--no-pi` and `cpu_tiny` are the big levers.
+- **Everything is slow:** see section 3. `--no-pi`, `--profile cpu_small` and `cpu_tiny` are the big levers.
+- **K2-Horizon prints `[ERROR] cache_position ... not documented` or a `cache_position` warning:**
+  harmless. These are style checks from transformers about IFM's own model code; nothing is wrong.
 - **Tests:** from the project folder, `.venv\Scripts\python -m pytest tests` (Linux/macOS: `.venv/bin/python -m pytest tests`).
 
 ---
@@ -296,5 +322,6 @@ Not verified (only possible on the lab PC):
 - LoRA (Hu et al., 2021), QLoRA (Dettmers et al., 2023), rsLoRA (Kalajdzievski, 2023),
   Thinking Machines, *LoRA Without Regret* (2025)
 - Pi coding agent: `@earendil-works/pi-coding-agent` · llama.cpp `/v1/systemone` (ggml-org/llama.cpp PR #30383)
-- Models: `unsloth/Qwen3.8-27B-GGUF`, `unsloth/Qwen3.8-27B`, `unsloth/Qwen3.5-{0.8B,2B,4B}`, `vllm-sr/d3-flash`
+- Models: `unsloth/Qwen3.8-27B-GGUF`, `unsloth/Qwen3.8-27B`, `IFM/K2-Horizon-7B`, `IFM/K2-Horizon-3.7B` (+ `-GGUF`),
+  `unsloth/Qwen3.5-{0.8B,2B,4B}`, `vllm-sr/d3-flash`
   (GGUF: `ggml-org/vllm-d3-flash-GGUF`)

@@ -113,7 +113,9 @@ class Trainer:
             train_dir = C.repo_dir(prof["train_repo"])
             if not (train_dir / "config.json").exists():
                 sys.exit(f"Model not found at {train_dir}. Run setup first (it downloads the models).")
-            self.tok = ChatTokenizer(str(train_dir), gen["enable_thinking"], gen.get("reasoning_effort"))
+            trust = bool(prof.get("trust_remote_code", False))
+            self.tok = ChatTokenizer(str(train_dir), gen["enable_thinking"],
+                                     prof.get("reasoning_effort", gen.get("reasoning_effort")), trust)
             device = "cuda" if self.profile.startswith("cuda") and torch.cuda.is_available() else "cpu"
             if device == "cpu":
                 import psutil
@@ -123,7 +125,8 @@ class Trainer:
             st = C.read_state("engine.json")
             if self.engine_name == "llamacpp" and st.get("lora_targets") == "mlp_only":
                 cfg["lora"]["target_modules"] = "mlp_only"  # what the self-test found llama.cpp accepts
-            self.policy = Policy(str(train_dir), cfg["lora"], cfg["optim"], prof["quant_4bit"], prof["dtype"], device)
+            self.policy = Policy(str(train_dir), cfg["lora"], cfg["optim"], prof["quant_4bit"], prof["dtype"], device,
+                                 trust_remote_code=trust)
             self.model_name = prof["train_repo"].split("/")[-1]
             if self.engine_name == "llamacpp":
                 from .engines.llamacpp import LlamaCppEngine
@@ -331,7 +334,7 @@ class Trainer:
             "turn_limit_hits": sum(1 for a in attempts if a.rollout.truncated),
         }
         for prefix, st in (("solver", s_st), ("maker", m_st)):
-            for k in ("loss", "grad_norm", "samples", "tokens", "kl", "clip_frac"):
+            for k in ("loss", "grad_norm", "samples", "tokens", "kl", "clip_frac", "nonfinite_grads"):
                 row[f"{prefix}_{k}"] = st.get(k)
         if self.pi:
             pis = [a.pi for a in attempts if a.pi]
@@ -491,7 +494,7 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true", help="fake model: tests the whole pipeline in minutes")
     ap.add_argument("--steps", type=int, help="override run.total_steps")
     ap.add_argument("--max-hours", type=float, default=None)
-    ap.add_argument("--profile", choices=["cuda_large", "cuda_small", "cpu", "cpu_tiny"])
+    ap.add_argument("--profile", choices=["cuda_large", "lawson_b131", "cuda_small", "cpu", "cpu_small", "cpu_tiny"])
     ap.add_argument("--name", help="override run.name")
     ap.add_argument("--no-pi", action="store_true", help="single-shot solver instead of Pi")
     ap.add_argument("--pi-node", help="path to node (default: tools/node)")

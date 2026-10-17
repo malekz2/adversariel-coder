@@ -48,7 +48,8 @@ class Engine(ABC):
         """Load freshly trained LoRA adapters ({"maker": dir, "solver": dir})."""
 
     @abstractmethod
-    def generate(self, prompt_ids: list[int], params: GenParams, in_thinking: bool) -> GenResult:
+    def generate(self, prompt_ids: list[int], params: GenParams, think_end: int | None) -> GenResult:
+        """think_end: token that closes the thinking block the prompt opened (None = no thinking)."""
         ...
 
 

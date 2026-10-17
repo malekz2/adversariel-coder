@@ -93,7 +93,8 @@ class MockEngine(Engine):
             return "<tool_call>\n<function=bash>\n<parameter=command>\npython run_tests.py\n</parameter>\n</function>\n</tool_call>"
         return "The solution is written in solution.py and the visible tests were run."
 
-    def generate(self, prompt_ids, params: GenParams, in_thinking: bool) -> GenResult:
+    def generate(self, prompt_ids, params: GenParams, think_end: int | None) -> GenResult:
+        in_thinking = think_end is not None
         tok = self.tok
         prompt = tok.decode(prompt_ids)
         think, markers, forced = self._think(params.think_budget) if in_thinking else ("", 0, False)
@@ -104,7 +105,7 @@ class MockEngine(Engine):
         else:
             answer = "```python\n" + self._solution_for(prompt) + "```"
         think_ids = tok.encode(think) if in_thinking else []
-        out = think_ids + ([tok.think_end] if in_thinking else []) + tok.encode("\n\n" + answer) + [tok.im_end]
+        out = think_ids + ([think_end] if in_thinking else []) + tok.encode("\n\n" + answer) + [tok.im_end]
         mask = [1] * len(out)
         if forced and in_thinking:
             mask[len(think_ids)] = 0

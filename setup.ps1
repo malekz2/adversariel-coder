@@ -50,7 +50,7 @@ $freeGB = [math]::Round($drive.AvailableFreeSpace / 1GB, 1)
 Say "0/7 free space on $($drive.Name): $freeGB GB"
 if ($freeGB -lt 5) {
     throw ("Only $freeGB GB free on $($drive.Name). Setup needs about 3-4 GB for tools (more with an NVIDIA GPU), " +
-           "plus about 9-13 GB for the CPU models. Free some space (for example delete an older copy of this folder, " +
+           "plus the models: about 30 GB for K2-Horizon-7B (the no-GPU default), 9-13 GB for the smaller CPU profiles. Free some space (for example delete an older copy of this folder, " +
            "including its tools\uv-cache), or clone the repo onto a drive with more room.")
 }
 
@@ -139,7 +139,8 @@ if (-not $NoModels) {
     Say "6/7 models for profile '$hwProfile'"
     if ($ModelsDir -eq "") {
         $default = Join-Path $Root "models"
-        Write-Host "    The cpu profiles fit on the SD card. The 27B profile needs ~76 GB, so use the PC's own drive"
+        Write-Host "    Model sizes: K2-Horizon-7B (no GPU) ~30 GB, smaller CPU profiles 9-13 GB, 27B (big NVIDIA GPU) ~76 GB."
+        Write-Host "    Pick a folder on a drive with enough free space"
         Write-Host "    (note: some lab PCs wipe user folders at logout)."
         $ans = Read-Host "    Folder for models (Enter = $default)"
         if ($ans -ne "") { $ModelsDir = $ans } else { $ModelsDir = $default }

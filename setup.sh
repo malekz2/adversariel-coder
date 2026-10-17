@@ -20,7 +20,7 @@ mkdir -p "$TOOLS" "$DL" "$ROOT/state"
 FREE_GB=$(df -Pk "$ROOT" | awk 'NR==2 {printf "%.1f", $4/1048576}')
 echo "free space for $ROOT: $FREE_GB GB"
 if awk "BEGIN {exit !($FREE_GB < 5)}"; then
-  echo "Only $FREE_GB GB free. Setup needs ~3-4 GB for tools plus ~9-13 GB for CPU models. Free space or clone elsewhere."; exit 1
+  echo "Only $FREE_GB GB free. Setup needs ~3-4 GB for tools plus the models (~30 GB for K2-Horizon-7B, 9-13 GB for the smaller CPU profiles). Free space or clone elsewhere."; exit 1
 fi
 say() { printf '\n\033[36m==> %s\033[0m\n' "$*"; }
 fetch() { [ -f "$DL/$2" ] || { echo "    downloading $1"; curl -fL --retry 3 -o "$DL/$2.part" "$1"; mv "$DL/$2.part" "$DL/$2"; }; }
