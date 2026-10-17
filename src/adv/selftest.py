@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import shutil
 import sys
 import tempfile
@@ -62,40 +61,57 @@ def make_random_adapter(base_dir: Path, out_dir: Path, targets: list[str], r: in
     return out_dir
 
 
-def _serve_and_compare(server: str, gguf: str, lora_gguf: str, port: int, gpu_layers: str) -> tuple[bool, str]:
+def _start_server(server: str, args: list[str], port: int, log_name: str):
+    """Start llama-server and wait until healthy. Returns the process; raises RuntimeError if it dies."""
     import subprocess
-    log = Path(tempfile.gettempdir()) / "adv_selftest_server.log"
-    proc = subprocess.Popen([server, "-m", gguf, "--lora", lora_gguf, "--lora-init-without-apply", "--host",
-                             "127.0.0.1", "--port", str(port), "-c", "2048", "-np", "1", "-ngl", str(gpu_layers),
-                             "--no-webui", "--log-file", str(log)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    log = Path(tempfile.gettempdir()) / log_name
+    proc = subprocess.Popen([server, *args, "--host", "127.0.0.1", "--port", str(port), "--log-file", str(log)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 900:
+        if proc.poll() is not None:
+            raise RuntimeError(f"llama-server exited ({proc.returncode}); see {log}")
+        try:
+            if requests.get(f"http://127.0.0.1:{port}/health", timeout=2).status_code == 200:
+                return proc
+        except requests.RequestException:
+            pass
+        time.sleep(1)
+    _stop_server(proc)
+    raise RuntimeError("llama-server did not start")
+
+
+def _stop_server(proc):
+    proc.terminate()
     try:
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < 900:
-            if proc.poll() is not None:
-                return False, f"llama-server exited ({proc.returncode}); see {log}"
-            try:
-                if requests.get(f"http://127.0.0.1:{port}/health", timeout=2).status_code == 200:
-                    break
-            except requests.RequestException:
-                pass
-            time.sleep(1)
-        else:
-            return False, "llama-server did not start"
-        outs = []
-        for scale in (0.0, 1.0):
-            r = requests.post(f"http://127.0.0.1:{port}/completion", timeout=600, json={
-                "prompt": [9707, 11, 1879, 0, 330], "n_predict": 6, "temperature": 0, "return_tokens": True,
-                "lora": [{"id": 0, "scale": scale}]})
-            outs.append(r.json().get("tokens"))
+        proc.wait(timeout=30)
+    except Exception:
+        proc.kill()
+
+
+def _complete(port: int, prompt: list[int], scale: float, n: int) -> tuple[list[int], dict]:
+    r = requests.post(f"http://127.0.0.1:{port}/completion", timeout=900, json={
+        "prompt": prompt, "n_predict": n, "temperature": 0, "return_tokens": True, "cache_prompt": False,
+        "lora": [{"id": 0, "scale": scale}]})
+    r.raise_for_status()
+    d = r.json()
+    return list(d.get("tokens") or []), d.get("timings") or {}
+
+
+def _serve_and_compare(server: str, gguf: str, lora_gguf: str, port: int, gpu_layers: str) -> tuple[bool, str]:
+    args = ["-m", gguf, "--lora", lora_gguf, "--lora-init-without-apply", "-c", "2048", "-np", "1",
+            "-ngl", str(gpu_layers), "--no-webui"]
+    try:
+        proc = _start_server(server, args, port, "adv_selftest_server.log")
+    except RuntimeError as e:
+        return False, str(e)
+    try:
+        outs = [_complete(port, [9707, 11, 1879, 0, 330], scale, 6)[0] for scale in (0.0, 1.0)]
         if outs[0] == outs[1]:
             return False, f"LoRA had no effect (tokens {outs[0]})"
         return True, f"scale0 {outs[0]} vs scale1 {outs[1]}"
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=30)
-        except Exception:
-            proc.kill()
+        _stop_server(proc)
 
 
 def check_d3(server: str, gguf: str, port: int) -> tuple[bool, str]:
@@ -130,6 +146,87 @@ def check_d3(server: str, gguf: str, port: int) -> tuple[bool, str]:
             proc.kill()
 
 
+def _selftest_mlx(cfg, prof, profile, skip_d3):
+    """Mac: load both MLX models, generate a few tokens with each, and check the referee."""
+    import gc
+    import mlx.core as mx
+    from mlx_lm import load
+    from mlx_lm.generate import generate_step
+    from .safety import Limits, MemoryGuard, limit_mlx_memory
+    safety = prof.get("safety") or {}
+    mem = limit_mlx_memory(float(safety.get("mlx_memory_fraction", 0.6)))
+    guard = MemoryGuard(Limits(**{k: v for k, v in safety.items() if k in Limits.__dataclass_fields__}), str(C.ROOT))
+    print(f"[selftest] MLX memory capped at {mem['mlx_limit_gb']:.1f} of {mem['total_gb']:.1f} GB")
+    result = {"engine": "mlx", "profile": profile}
+    for role in ("maker", "solver"):   # one model at a time, freed before the next
+        path = C.repo_dir(prof[f"{role}_repo"])
+        try:
+            guard.check(f"loading {role}", force=True)
+            model, tok = load(str(path), tokenizer_config={"trust_remote_code": True},
+                              trust_remote_code=bool(prof.get("trust_remote_code")))
+            ids = tok.encode("def add(a, b):")
+            out = [int(t) for t, _ in generate_step(mx.array(ids), model, max_tokens=8)]
+            print(f"[selftest] {role}: {path.name} OK -> {tok.decode(out)!r}")
+            result[role] = f"ok (peak MLX memory {mx.get_peak_memory() / 1024 ** 3:.1f} GB)"
+            del model, tok
+            gc.collect()
+            mx.clear_cache()
+            mx.reset_peak_memory()
+        except Exception as e:
+            print(f"[selftest] {role}: FAILED {str(e)[:300]}")
+            result[role] = f"failed: {str(e)[:300]}"
+    t = C.tools()
+    d3 = C.repo_dir(cfg["decision"]["d3_repo"]) / cfg["decision"]["d3_file"]
+    if not skip_d3 and t["llama_server"] and d3.exists():
+        ok, msg = check_d3(t["llama_server"], str(d3), cfg["ports"]["d3"])
+        print(f"[selftest] referee {d3.name}: {'OK' if ok else 'FAILED'}: {msg}")
+        result["d3"] = "ok" if ok else f"failed: {msg}"
+    else:
+        result["d3"] = "missing"
+    (C.state_dir() / "engine.json").write_text(json.dumps(result, indent=2))
+    print(json.dumps(result, indent=2))
+
+
+CODE_PROMPTS = [
+    'def merge_intervals(intervals):\n    """Merge overlapping closed intervals and return them sorted."""\n',
+    'def longest_unique(s):\n    """Length of the longest substring of s without repeated characters."""\n',
+    'def coin_ways(coins, amount):\n    """Number of multisets of coins that sum to amount."""\n',
+    'def balanced(s):\n    """True if every bracket in s is matched and properly nested."""\n',
+]
+
+
+def _selftest_rollouts(cfg, prof, base, gguf, lora_gguf, t) -> dict:
+    """Pick the fastest KV-cache type and speculative setting at real concurrency (see rollout_tune)."""
+    from transformers import AutoTokenizer
+    from .rollout_tune import LlamaServerProbe, tune_rollouts
+    spec = prof.get("speculative") or {}
+    draft = str(C.repo_dir(spec["draft_repo"]) / spec["draft_file"]) if spec.get("draft_repo") else None
+    tok = AutoTokenizer.from_pretrained(str(base), trust_remote_code=bool(prof.get("trust_remote_code")))
+    enc = lambda text: tok.encode(text, add_special_tokens=False)  # noqa: E731
+    exact_prompts = [enc(p) for p in CODE_PROMPTS[:3]]
+    n_req = int(prof["parallel_slots"])   # a batch of parallel Pi attempts
+    speed_prompts = [enc(f"# attempt {i}\n" + CODE_PROMPTS[i % len(CODE_PROMPTS)]) for i in range(n_req)]
+    extra = [str(a) for a in prof.get("llama_extra_args") or []]
+    ctx = int(prof["ctx_per_slot"])
+
+    def base_args(kv, slots):
+        args = ["-m", gguf, "--lora", lora_gguf, "--lora-init-without-apply", "-c", str(ctx * slots),
+                "-np", str(slots), "-ngl", str(prof["llama_gpu_layers"]), "--no-webui", *extra]
+        return args + (["-ctk", kv, "-ctv", kv] if kv else [])
+
+    print(f"[selftest] tuning rollouts ({n_req} parallel requests): KV types {prof.get('kv_cache_types')}, "
+          f"speculative candidates {[c['type'] for c in spec.get('candidates') or []]} (takes ~10-20 min)")
+    res = tune_rollouts(LlamaServerProbe(t["llama_server"], cfg["ports"]["engine"]), base_args, prof, draft,
+                        exact_prompts, speed_prompts, log=print)
+    if res.get("ok"):
+        sp = res["speculative"]["type"] if res.get("speculative") else "off"
+        print(f"[selftest]   chosen: KV {res['kv_cache']}, {res['slots']} slots, speculative {sp}: "
+              f"{res['tokens_per_s']} tok/s ({res['speedup']}x vs plain decoding with the best KV type)")
+    else:
+        print(f"[selftest]   rollout tuning failed: {res.get('reason')}")
+    return res
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--base")
@@ -140,6 +237,9 @@ def main(argv=None):
     cfg = C.load()
     profile = a.profile or C.resolve_profile(cfg)
     prof = cfg["profiles"][profile]
+    C.apply_overrides(cfg, prof.get("overrides") or {})
+    if prof.get("backend") == "mlx":
+        return _selftest_mlx(cfg, prof, profile, a.skip_d3)
     base = Path(a.base) if a.base else C.repo_dir(prof["train_repo"])
     gguf = a.gguf or str(C.repo_dir(prof["gguf_repo"]) / prof["gguf_file"])
     t = C.tools()
@@ -163,6 +263,8 @@ def main(argv=None):
                 print(f"[selftest]   {'OK' if ok else 'FAILED'}: {msg}")
                 if ok:
                     result.update(engine="llamacpp", lora_targets=name, detail=msg)
+                    if prof.get("speculative") or prof.get("kv_cache_types"):
+                        result["rollout"] = _selftest_rollouts(cfg, prof, base, gguf, out, t)
                     break
                 result[f"reason_{name}"] = msg
         finally:

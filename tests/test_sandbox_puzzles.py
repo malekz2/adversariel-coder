@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from adv.puzzles import (NoveltyBuffer, Puzzle, code_hygiene_error, load_seed_puzzles, parse_maker_output,
+from adv.puzzles import (NoveltyBuffer, code_hygiene_error, load_seed_puzzles, parse_maker_output,
                          validate, write_workspace)
 from adv.sandbox import outputs_equal, run_function, score_against
 

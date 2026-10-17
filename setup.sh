@@ -53,6 +53,10 @@ TORCH_BACKEND=cpu; [ "$HAS_NVIDIA" = 1 ] && TORCH_BACKEND=auto
 echo "    torch backend: $TORCH_BACKEND"
 "$UV" pip install --python "$PY" "torch==$TORCH" --torch-backend "$TORCH_BACKEND"
 "$UV" pip install --python "$PY" -r "$ROOT/requirements.txt"
+if [ "$OS-$ARCH" = Darwin-arm64 ]; then
+  echo "    Apple Silicon: installing MLX (mac_mlx profile: MiniCPM5 Maker + K2-Horizon Solver)"
+  "$UV" pip install --python "$PY" mlx==0.32.4 mlx-lm==0.32.2
+fi
 if [ "$HAS_NVIDIA" = 1 ]; then
   "$UV" pip install --python "$PY" bitsandbytes==0.50.2
   "$UV" pip install --python "$PY" flash-linear-attention || echo "    (optional fast kernels skipped)"

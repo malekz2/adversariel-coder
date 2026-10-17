@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
-import copy
 import json
 import os
 import random
@@ -34,7 +33,7 @@ from .bias import load_markers, resolve
 from .decision import Controller, D3Referee, RuleReferee, consult
 from .engines.base import GenParams
 from .grpo import Sample, group_advantages
-from .logbook import ETA, History, atomic_write, render_log
+from .logbook import ETA, History, atomic_write, budget_allows_next_step, budget_seconds, projected_remaining, render_log
 from .plots import render as render_png
 from .proxy import RecordingProxy, Rollout
 from .puzzles import (PI_SOLVER_PROMPT, NoveltyBuffer, Puzzle, extract_python_code, load_seed_puzzles,
@@ -79,6 +78,7 @@ class Trainer:
         self.rng = random.Random(cfg["run"]["seed"])
         self.profile = args.profile or C.resolve_profile(cfg)
         self.prof = cfg["profiles"][self.profile]
+        C.apply_overrides(cfg, self.prof.get("overrides") or {})  # e.g. bigger steps on the 27B profile
         self.run_dir = C.ROOT / "runs" / cfg["run"]["name"]
         (self.run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
         (self.run_dir / "logs").mkdir(exist_ok=True)
@@ -107,6 +107,8 @@ class Trainer:
             self.engine = MockEngine(self.tok, cfg["run"]["seed"])
             self.policy = MockPolicy(self.engine, cfg["run"]["seed"])
             self.engine_name, self.model_name = "mock", "fake model, no weights"
+        elif prof.get("backend") == "mlx":
+            self._build_mlx()
         else:
             import torch
             from .tokenizer import ChatTokenizer
@@ -132,34 +134,41 @@ class Trainer:
             if self.engine_name == "llamacpp":
                 from .engines.llamacpp import LlamaCppEngine
                 gguf = C.repo_dir(prof["gguf_repo"]) / prof["gguf_file"]
+                rs = self._rollout_settings()
                 self.engine = LlamaCppEngine(
                     self.tok, self.tools["llama_server"], str(gguf), port=cfg["ports"]["engine"],
-                    ctx_per_slot=prof["ctx_per_slot"], parallel=prof["parallel_slots"],
+                    ctx_per_slot=prof["ctx_per_slot"], parallel=rs["slots"],
                     gpu_layers=prof["llama_gpu_layers"], log_file=str(self.run_dir / "logs" / "llama-server.log"),
+                    extra_args=[str(a) for a in prof.get("llama_extra_args") or []],
                     converter={"script": self.tools["convert_lora"], "gguf_py": self.tools["gguf_py"],
                                "python": sys.executable, "base_model_dir": str(train_dir)},
                     adapter_gguf_dir=str(self.run_dir / "adapters_gguf"),
-                    swap_during_training=prof["swap_engine_during_training"])
+                    swap_during_training=prof["swap_engine_during_training"], spec_args=rs["args"])
             else:
                 from .engines.hf import HFEngine
                 self.engine = HFEngine(self.tok, self.policy)
 
-        # overthinking bias (thinking-only), re-derived from the words with this tokenizer
+        # one tokenizer per role: the same one when both roles share a model, different ones on the Mac
+        if not hasattr(self, "toks"):
+            self.toks = {"maker": self.tok, "solver": self.tok}
+
+        # overthinking bias (thinking-only), re-derived from the words with each role's tokenizer
         ob = cfg["overthinking_bias"]
-        self.bias_report = None
-        bias_ids = {}
+        self.bias_reports = {}
         if ob["enabled"] and not args.dry_run:  # the mock tokenizer is character-level: nothing to bias
-            self.bias_report = resolve(self.tok, load_markers(C.ROOT / ob["file"]))
-            bias_ids = self.bias_report.ids
-            print("overthinking bias:", self.bias_report.summary())
+            markers = load_markers(C.ROOT / ob["file"])
+            for role in ob["roles"]:
+                self.bias_reports[role] = resolve(self.toks[role], markers)
+                print(f"overthinking bias ({role}):", self.bias_reports[role].summary())
         self.params = {}
         for role in ("maker", "solver"):
             g = gen[role]
+            rep = self.bias_reports.get(role)
             self.params[role] = GenParams(adapter=role, max_new_tokens=g["max_new_tokens"], temperature=g["temperature"],
                                           top_p=g["top_p"], top_k=g["top_k"], think_budget=g["think_budget"],
-                                          think_bias=bias_ids if role in ob["roles"] else {})
+                                          think_bias=rep.ids if rep else {})
         self.proxy = RecordingProxy(self.tok, self.engine, self.params, max_ctx=prof["ctx_per_slot"],
-                                    port=cfg["ports"]["proxy"])
+                                    port=cfg["ports"]["proxy"], toks=self.toks)
 
         self.pi = None
         if cfg["solver"]["use_pi"] and not args.no_pi:
@@ -180,6 +189,53 @@ class Trainer:
         self.referee = self._pick_referee()
         self.seeds = load_seed_puzzles(C.ROOT / "data" / "seed_puzzles.jsonl", cfg["sandbox"]["timeout_s"])
 
+    def _build_mlx(self):
+        """Apple Silicon: two DIFFERENT models (e.g. MiniCPM5 Maker, K2-Horizon Solver), each with its own
+        LoRA adapter, trained and sampled in MLX in this process (no llama.cpp, no weight syncing)."""
+        cfg, prof, gen = self.cfg, self.prof, self.cfg["generation"]
+        from .engines.mlx_engine import MLXEngine
+        from .policy_mlx import MLXPolicy
+        from .tokenizer import ChatTokenizer
+        from .safety import Limits, MemoryDanger, MemoryGuard
+        dirs = {role: C.repo_dir(prof[f"{role}_repo"]) for role in ("maker", "solver")}
+        for d in dirs.values():
+            if not (d / "config.json").exists():
+                sys.exit(f"Model not found at {d}. Run setup first (it downloads the models).")
+        safety = prof.get("safety") or {}
+        self.guard = MemoryGuard(Limits(**{k: v for k, v in safety.items() if k in Limits.__dataclass_fields__}),
+                                 disk_path=str(C.ROOT))
+        try:
+            self.guard.check("start-up", force=True)
+        except MemoryDanger as e:
+            sys.exit(f"Not starting: {e}. Close other apps / free disk space first (see README, Mac section).")
+        trust = bool(prof.get("trust_remote_code", False))
+        effort = prof.get("reasoning_effort", gen.get("reasoning_effort"))
+        self.toks = {role: ChatTokenizer(str(d), gen["enable_thinking"], effort, trust) for role, d in dirs.items()}
+        self.tok = self.toks["solver"]
+        self.policy = MLXPolicy({role: str(d) for role, d in dirs.items()}, cfg["lora"], cfg["optim"],
+                                trust_remote_code=trust, grad_checkpoint=bool(prof.get("grad_checkpoint", True)),
+                                guard=self.guard, mlx_memory_fraction=float(safety.get("mlx_memory_fraction", 0.6)))
+        print(f"MLX memory capped at {self.policy.memory['mlx_limit_gb']:.1f} of {self.policy.memory['total_gb']:.1f} GB")
+        self.engine = MLXEngine(self.toks, self.policy, max_parallel=int(prof.get("parallel_slots", 4)), guard=self.guard)
+        self.engine_name = "mlx"
+        self.model_name = " + ".join(f"{role} {prof[f'{role}_repo'].split('/')[-1]}" for role in ("maker", "solver"))
+
+    def _rollout_settings(self) -> dict:
+        """KV-cache type, parallel slots and speculative decoding: what setup's self-test measured as fastest
+        with unchanged output (state/engine.json "rollout"), or the profile's defaults if it hasn't run."""
+        from .rollout_tune import rollout_settings
+        spec = self.prof.get("speculative") or {}
+        draft = str(C.repo_dir(spec["draft_repo"]) / spec["draft_file"]) if spec.get("draft_repo") else None
+        rs = rollout_settings(self.prof, C.read_state("engine.json"), draft)
+        self.spec_label = rs["spec_label"]
+        self.rollout_label = f"KV {rs['kv_cache'] or 'f16'}, {rs['slots']} slots"
+        if rs["note"]:
+            print(rs["note"])
+        if rs["spec_label"]:
+            print(f"speculative decoding: {rs['spec_label']} at {rs['slots']} slots, KV {rs['kv_cache']} "
+                  f"(self-test: {rs['speedup']}x the throughput of plain decoding)")
+        return rs
+
     def _pick_engine(self) -> str:
         choice = self.cfg.get("engine", "auto")
         if choice != "auto":
@@ -195,11 +251,11 @@ class Trainer:
             return RuleReferee()
         gguf = C.repo_dir(d["d3_repo"]) / d["d3_file"]
         if not (gguf.exists() and self.tools["llama_server"]):
-            print("referee: d3-flash GGUF or llama-server missing -> rule-based referee")
+            print(f"referee: {d['d3_file']} or llama-server missing -> rule-based referee")
             return RuleReferee()
         if d["backend"] == "auto":
-            import psutil
-            free_gb = psutil.virtual_memory().available / 1e9
+            from .safety import free_memory_gb  # macOS: counts reclaimable cache as free
+            free_gb = free_memory_gb() * 1.073741824   # GiB -> GB, to compare with the file size in GB
             if free_gb < gguf.stat().st_size / 1e9 + 2:
                 print(f"referee: only {free_gb:.1f} GB RAM free -> rule-based referee")
                 return RuleReferee()
@@ -255,35 +311,40 @@ class Trainer:
             frac = score_against(rr, p.expected)
         return Attempt(p, ro, code, frac, solver_reward(frac, code is not None, self.cfg["rewards"]), pi_res)
 
-    def _pmap(self, fn, items):
-        workers = max(1, min(len(items), getattr(self.engine, "max_parallel", 1)))
-        with cf.ThreadPoolExecutor(max_workers=workers) as ex:
-            return list(ex.map(fn, items))
-
     # ------------------------------------------------------------------ one step
     def step(self, step: int) -> dict:
         cfg, knobs = self.cfg, self.controller.knobs
         g = cfg["grpo"]
         t0 = time.monotonic()
         self.params["maker"].temperature = knobs["maker_temperature"]
+        if getattr(self, "guard", None):
+            self.guard.check("step start", force=True)
         self._rollout_phase()
 
-        # 1-2. Maker writes puzzles; sandbox validates
+        # 1-4. Maker writes puzzles, the sandbox validates them, and each valid puzzle is handed to the Solver
+        # (G attempts) the moment it is ready, so the GPU never idles waiting for the slowest Maker reply.
         jobs = [maker_messages(pick_topic(self.rng), knobs["difficulty"], self.rng.sample(self.seeds, 2), self.titles)
                 for _ in range(g["puzzles_per_step"])]
-        makers = self._pmap(self._maker_one, jobs)
-        for m in makers:
-            if m.puzzle:
-                m.novelty = self.novelty.max_similarity(m.puzzle.statement)
-                self.novelty.add(m.puzzle.statement)
-                self.titles.append(m.puzzle.title)
-
-        # 3-4. Solver attempts each valid puzzle G times (+ seed puzzles if the referee asked)
-        batch = [m.puzzle for m in makers if m.puzzle]
-        if knobs["inject_seeds_steps"] > 0:
-            batch += self.rng.sample(self.seeds, 2)
-            knobs["inject_seeds_steps"] -= 1
-        attempts = self._pmap(self._solve_one, [p for p in batch for _ in range(g["solver_attempts"])])
+        G = g["solver_attempts"]
+        makers: list[MakerOut] = [None] * len(jobs)  # type: ignore[list-item]
+        attempt_futs: list[cf.Future] = []
+        with cf.ThreadPoolExecutor(max_workers=max(1, getattr(self.engine, "max_parallel", 1))) as ex:
+            maker_futs = {ex.submit(self._maker_one, msgs): i for i, msgs in enumerate(jobs)}
+            if knobs["inject_seeds_steps"] > 0:  # known-good puzzles if the referee asked for them
+                for p in self.rng.sample(self.seeds, 2):
+                    attempt_futs += [ex.submit(self._solve_one, p) for _ in range(G)]
+                knobs["inject_seeds_steps"] -= 1
+            for fut in cf.as_completed(maker_futs):
+                m = makers[maker_futs[fut]] = fut.result()
+                if m.puzzle:
+                    m.novelty = self.novelty.max_similarity(m.puzzle.statement)
+                    self.novelty.add(m.puzzle.statement)
+                    self.titles.append(m.puzzle.title)
+                    attempt_futs += [ex.submit(self._solve_one, m.puzzle) for _ in range(G)]
+            attempts = [f.result() for f in attempt_futs]
+        if getattr(self, "guard", None) and self.guard.tripped:  # tripped inside a Pi/proxy thread
+            from .safety import MemoryDanger
+            raise MemoryDanger(self.guard.tripped)
         t_roll = time.monotonic() - t0
 
         by_uid: dict[str, list[Attempt]] = {}
@@ -381,7 +442,16 @@ class Trainer:
         dirs = {n: export_for_llamacpp(d, str(C.repo_dir(self.prof["train_repo"])), str(export / n))
                 for n, d in raw.items()}
         # swap profiles: the server is (re)started by the next rollout phase, after the trainer left the GPU
-        self.engine.sync_adapters(dirs, restart=not self.prof.get("swap_engine_during_training", False))
+        restart = not self.prof.get("swap_engine_during_training", False)
+        if self.offload_trainer:
+            # converting adapters is CPU work, moving the trainer to RAM is PCIe work: do both at once
+            with cf.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(self.engine.sync_adapters, dirs, False)
+                if not self.policy.offload():
+                    self.offload_trainer = False
+                fut.result()
+        else:
+            self.engine.sync_adapters(dirs, restart=restart)
 
     # ------------------------------------------------------------------ checkpoints
     def save_checkpoint(self, step: int):
@@ -426,18 +496,22 @@ class Trainer:
 
     # ------------------------------------------------------------------ output
     def write_outputs(self, note: str = ""):
-        header = {"profile": self.profile, "model": self.model_name, "engine": self.engine_name,
+        engine = self.engine_name + (f" ({self.rollout_label})" if getattr(self, "rollout_label", "") else "")
+        engine += f" + speculative {self.spec_label}" if getattr(self, "spec_label", "") else ""
+        header = {"profile": self.profile, "model": self.model_name, "engine": engine,
                   "referee": self.referee.backend, "harness": self.harness}
         text = render_log(cfg=self.cfg, header=header, history=self.history.rows, eta=self.eta, started=self.started,
                           verdicts=self.verdicts, sample=getattr(self, "sample", None))
-        if self.bias_report:
-            text += f"\noverthinking bias: {self.bias_report.summary()}\n"
+        for role, rep in self.bias_reports.items():
+            text += f"\noverthinking bias ({role}): {rep.summary()}"
+        if self.bias_reports:
+            text += "\n"
         if note:
             text = note + "\n\n" + text
         atomic_write(self.log_path, text)
         total = self.cfg["run"]["total_steps"]
         done = self.history.rows[-1]["step"] + 1 if self.history.rows else 0
-        rem = self.eta.remaining(total - done, max(0, (total - done) // self.cfg["decision"]["every"]))
+        rem = projected_remaining(self.cfg, self.eta, done, time.time() - self.started)
         render_png(self.history.rows, self.verdicts,
                    f"{self.cfg['run']['name']}: step {done}/{total} ({self.model_name}, {self.harness})", rem, self.png_path)
 
@@ -446,6 +520,7 @@ class Trainer:
         cfg = self.cfg
         total = cfg["run"]["total_steps"]
         max_h = self.args.max_hours if self.args.max_hours is not None else cfg["run"]["max_hours"]
+        budget_s = budget_seconds(cfg)  # whole run, across resumes (elapsed is restored from the checkpoint)
         if self.args.resume:
             self.try_resume()
         if self.engine_name == "llamacpp":
@@ -458,6 +533,11 @@ class Trainer:
         note = ""
         try:
             for step in range(self.start_step, total):
+                if not budget_allows_next_step(time.time() - self.started, self.eta.per_step(), budget_s):
+                    note = (f"STOPPED: {budget_s / 3600:g} h time budget reached after {step} steps "
+                            "(another step would not finish in time). Raise run.time_budget_hours to train longer.")
+                    step -= 1  # the checkpoint below is for the last finished step
+                    break
                 row = self.step(step)
                 self.eta.update(row["step_seconds"])
                 self.history.append(row)
@@ -474,9 +554,14 @@ class Trainer:
                 note = "FINISHED all steps."
         except KeyboardInterrupt:
             note = "STOPPED by Ctrl+C. Run resume to continue."
-        except Exception:
-            note = "CRASHED:\n" + traceback.format_exc()
-            raise
+        except Exception as e:
+            from .safety import MemoryDanger
+            if not isinstance(e, MemoryDanger):
+                note = "CRASHED:\n" + traceback.format_exc()
+                raise
+            note = (f"STOPPED for safety: {e}. Nothing was lost (checkpoint saved). Close other apps, free disk "
+                    "space or lower max_seq_len / parallel_slots, then run resume.")
+            step -= 1  # the interrupted step did not finish
         finally:
             if step >= self.start_step:
                 self.save_checkpoint(step)
@@ -509,7 +594,7 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true", help="fake model: tests the whole pipeline in minutes")
     ap.add_argument("--steps", type=int, help="override run.total_steps")
     ap.add_argument("--max-hours", type=float, default=None)
-    ap.add_argument("--profile", choices=["cuda_large", "cuda_mid", "cuda_small", "cpu", "cpu_small", "cpu_tiny"])
+    ap.add_argument("--profile", choices=["mac_mlx", "cuda_large", "cuda_mid", "cuda_small", "cpu", "cpu_small", "cpu_tiny"])
     ap.add_argument("--name", help="override run.name")
     ap.add_argument("--no-pi", action="store_true", help="single-shot solver instead of Pi")
     ap.add_argument("--pi-node", help="path to node (default: tools/node)")

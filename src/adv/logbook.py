@@ -70,6 +70,44 @@ class ETA:
         self.ema, self.recent, self.decision_cost = s.get("ema"), s.get("recent", []), s.get("decision_cost", 0.0)
 
 
+BUDGET_SAFETY = 1.15     # assume the next step may be 15 % slower than the estimate
+BUDGET_RESERVE_S = 120   # time kept free for the final checkpoint, log.txt and train.png
+
+
+def budget_seconds(cfg: dict) -> float:
+    return float(cfg["run"].get("time_budget_hours") or 0) * 3600
+
+
+def budget_allows_next_step(elapsed: float, per_step: float | None, budget_s: float) -> bool:
+    """Start another step only if it should finish (with margin) inside the time budget."""
+    if not budget_s:
+        return True
+    if per_step is None:  # no estimate yet: the first step always runs (it measures the step time)
+        return True
+    return elapsed + BUDGET_SAFETY * per_step + BUDGET_RESERVE_S <= budget_s
+
+
+def steps_that_fit(elapsed: float, per_step: float | None, budget_s: float) -> int | None:
+    if not budget_s or not per_step:
+        return None
+    return max(0, int((budget_s - BUDGET_RESERVE_S - elapsed) // (BUDGET_SAFETY * per_step)))
+
+
+def projected_remaining(cfg: dict, eta: "ETA", done: int, elapsed: float) -> float | None:
+    """Seconds left: the step-based ETA, capped by the time budget (whichever ends first)."""
+    total, every = cfg["run"]["total_steps"], cfg["decision"]["every"]
+    steps_left = total - done
+    budget_s = budget_seconds(cfg)
+    fit = steps_that_fit(elapsed, eta.per_step(), budget_s)
+    if fit is not None:
+        steps_left = min(steps_left, fit)
+    rem = eta.remaining(steps_left, max(0, steps_left // every))
+    if budget_s:
+        left = max(0.0, budget_s - elapsed)
+        rem = left if rem is None else min(rem, left)
+    return rem
+
+
 class History:
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -112,8 +150,9 @@ def render_log(*, cfg: dict, header: dict, history: list[dict], eta: ETA, starte
     done = step + 1 if history else 0
     w10, p10 = history[-10:], history[-20:-10]
     every = cfg["decision"]["every"]
-    decisions_left = max(0, (total - done) // every)
-    rem = eta.remaining(total - done, decisions_left)
+    elapsed = time.time() - started
+    rem = projected_remaining(cfg, eta, done, elapsed)
+    budget_s = budget_seconds(cfg)
     finish = (dt.datetime.now() + dt.timedelta(seconds=rem)).strftime("%a %d %b %H:%M") if rem is not None else "?"
 
     def trend(key):
@@ -128,6 +167,11 @@ def render_log(*, cfg: dict, header: dict, history: list[dict], eta: ETA, starte
     L.append(f"step {done} / {total}  {_bar(done / total)}  {100 * done / total:.1f}%")
     L.append(f"elapsed {fmt_dur(time.time() - started)} | last step {fmt_dur(last.get('step_seconds'))} | "
              f"avg {fmt_dur(eta.per_step())} | ETA {fmt_dur(rem)}  (≈ {finish})")
+    if budget_s:
+        hard_stop = dt.datetime.now() + dt.timedelta(seconds=max(0.0, budget_s - elapsed))
+        fit = steps_that_fit(elapsed, eta.per_step(), budget_s)
+        more = f" (≈ {min(fit, total - done)} more steps)" if fit is not None else ""
+        L.append(f"time budget {budget_s / 3600:g} h: stops by {hard_stop:%H:%M} at the latest{more}")
     if done < 3:
         L.append("  (ETA is rough for the first few steps: they include model loading and warm-up)")
     L.append("")

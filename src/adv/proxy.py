@@ -67,8 +67,9 @@ class Rollout:
 
 class RecordingProxy:
     def __init__(self, tok, engine: Engine, params: dict[str, GenParams], max_ctx: int = 16384,
-                 host: str = "127.0.0.1", port: int = 8282, min_new_tokens: int = 256):
+                 host: str = "127.0.0.1", port: int = 8282, min_new_tokens: int = 256, toks: dict | None = None):
         self.tok, self.engine, self.params = tok, engine, params
+        self.toks = toks or {}  # per-role tokenizers when the Maker and Solver are different models
         self.max_ctx, self.min_new_tokens = max_ctx, min_new_tokens
         self.host, self.port = host, port
         self.rollouts: dict[str, Rollout] = {}
@@ -100,7 +101,7 @@ class RecordingProxy:
             return self._chat_locked(ro, messages, tools, max_tokens)
 
     def _chat_locked(self, ro: Rollout, messages, tools, max_tokens) -> dict:
-        tok = self.tok
+        tok = self.toks.get(ro.role, self.tok)
         ro.requests += 1
         if ro.requests > ro.max_turns:
             ro.truncated = True

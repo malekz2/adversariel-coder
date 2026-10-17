@@ -20,7 +20,7 @@ import json
 import random
 import re
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from .sandbox import RunResult, outputs_equal, run_function

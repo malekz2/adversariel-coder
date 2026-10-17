@@ -268,7 +268,7 @@ def consult(referee, history: list[dict], knobs: dict, step: int, examples: list
         return parse_answers(answers, step, referee.backend, time.monotonic() - t0)
     except Exception as e:  # never let the referee crash training
         fallback = RuleReferee()
-        v = parse_answers(fallback.ask(state), step, f"rules (d3 failed)", time.monotonic() - t0)
+        v = parse_answers(fallback.ask(state), step, "rules (d3 failed)", time.monotonic() - t0)
         v.error = str(e)[:300]
         return v
 

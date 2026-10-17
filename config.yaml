@@ -7,13 +7,35 @@ run:
   log_every: 1               # overwrite log.txt + train.png every N steps
   checkpoint_every: 5        # save adapters + optimiser + state every N steps (resume picks the latest)
   keep_checkpoints: 3
-  max_hours: 0               # stop cleanly after this many hours (0 = no limit). Handy for lab sessions.
+  time_budget_hours: 3       # HARD limit for the whole run (incl. model loading, across resumes): no step starts
+                             # unless it should finish in time. total_steps is then just an upper cap. 0 = off.
+  max_hours: 0               # stop cleanly after this many hours of THIS session (0 = no limit)
   seed: 0
 
-# auto = check_hardware decides (cuda_large / cuda_mid / cuda_small / cpu / cpu_small / cpu_tiny); or force one of them
+# auto = check_hardware decides (mac_mlx / cuda_large / cuda_mid / cuda_small / cpu / cpu_small / cpu_tiny); or force one
 profile: auto
 
 profiles:
+  mac_mlx:                   # Apple Silicon Mac (e.g. your M5 MacBook): two DIFFERENT models, both 4-bit MLX
+    backend: mlx
+    maker_repo: openbmb/MiniCPM5-2B-MLX                # Maker: MiniCPM5-2B, 4-bit (official OpenBMB MLX build, 1.4 GB)
+    solver_repo: mlx-community/K2-Horizon-3.7B-4bit    # Solver: K2-Horizon-3.7B, 4-bit (4.1 GB; ships k2_horizon.py)
+    trust_remote_code: true
+    reasoning_effort: low    # K2-Horizon: short <ifm|think_faster> thinking; MiniCPM5 ignores it
+    grad_checkpoint: true    # recompute activations in backward instead of storing them (16 GB unified memory)
+    parallel_slots: 4        # Pi attempts in flight; MLX generates one sequence at a time
+    max_seq_len: 4096        # longest sequence trained on (activation memory grows with length)
+    ctx_per_slot: 4096       # Pi episodes are cut at this length, so they stay trainable
+    safety:                  # stop cleanly (checkpoint saved) instead of freezing the Mac
+      mlx_memory_fraction: 0.6               # cap MLX at 60 % of RAM (its default is MORE than the Mac has)
+      min_free_percent: 15                   # macOS's own free-memory % (counts reclaimable cache as free);
+                                             # stops at "critical" pressure, or "warning" below this
+      max_swap_growth_gb: 2.0
+      min_free_disk_gb: 10.0                 # macOS swaps to disk; too little free disk = frozen machine
+    overrides:
+      decision.d3_repo: ggml-org/vllm-d3-nano-GGUF    # d3-nano (2.2B) instead of d3-flash: fits next to both models
+      decision.d3_file: vllm-d3-nano-Q8_0.gguf        # official quantised build, 2.55 GB
+      decision.gpu_layers: all                         # Metal; only loaded while the referee is consulted
   cuda_large:                # NVIDIA GPU with >= 24 GB (e.g. RTX 4090, Purdue LWSN B131) + >= 32 GB RAM: the real experiment
     train_repo: unsloth/Qwen3.8-27B            # BF16 safetensors, quantised to 4-bit NF4 while loading (QLoRA)
     gguf_repo: unsloth/Qwen3.8-27B-GGUF
@@ -25,11 +47,30 @@ profiles:
     offload_activations: true                  # saved activations live in pinned RAM, not VRAM (~5 GB at 8k tokens)
     offload_trainer_during_rollouts: true      # trainer (~19 GB) waits in RAM while llama.cpp uses the GPU
     llama_build: cuda
-    llama_gpu_layers: auto   # normally all layers fit; "auto" degrades gracefully if VRAM is already in use
-    parallel_slots: 4
+    llama_gpu_layers: all    # the trainer is parked in RAM during rollouts, so the whole 27B fits on the GPU
+    parallel_slots: 8        # Pi attempts generating at once (the self-test may pick fewer if speculation wins)
+    llama_extra_args: ["-fa", "on", "--fit", "off", "--cache-ram", "2048"]
+                             # --fit off: one 4090 report saw erratic 9-20 tok/s with fit on; cap RAM prompt cache
+    kv_cache_types: ["q8_0", "q4_0", "f16"]   # setup's self-test times each at full concurrency and keeps the
+                                               # fastest (one report: non-q4 KV can silently fall back to CPU)
     swap_engine_during_training: true          # llama-server is stopped while the trainer is on the GPU
     max_seq_len: 8192
     ctx_per_slot: 8192
+    overrides:               # applied to the rest of this file when this profile is active
+      grpo.puzzles_per_step: 8                 # fewer, bigger steps: fixed per-step costs are paid less often
+    speculative:             # faster rollouts, same output: the 27B verifies every drafted token
+      draft_repo: z-lab/Qwen3.8-27B-DFlash2-GGUF   # DFlash2 block drafter from the DFlash authors
+      draft_file: Qwen3.8-27B-DFlash2-Q4_K_M.gguf  # 1.1 GB; ~5.3 tokens accepted per 27B pass (greedy benchmark)
+      candidates:            # the self-test checks each with our LoRA and times it at real concurrency
+        - {type: "draft-mtp,ngram-mod", n_max: 3}     # MTP head is built into Unsloth's GGUF (no extra file)
+        - {type: "draft-mtp", n_max: 3}
+        - {type: "draft-dflash,ngram-mod", n_max: 7}
+        - {type: "draft-dflash", n_max: 7}
+        - {type: "ngram-mod"}                         # n-gram lookup only (copies text already in the context)
+      slots: [8, 4]          # speculation helps single streams most, so also try it with fewer parallel attempts
+      min_gain: 1.05         # use speculation only if it beats plain decoding by at least 5 % in throughput
+      min_agreement: 0.95    # greedy tokens must match plain decoding this closely (tiny float differences allowed)
+      args: ["--spec-draft-ngl", "all"]
   cuda_mid:                  # NVIDIA GPU with 10-14 GB, e.g. RTX 2080 Ti (11 GB) / RTX 3060 (12 GB)
     train_repo: IFM/K2-Horizon-3.7B           # same family / chat format as the cpu profile's K2-Horizon-7B
     gguf_repo: IFM/K2-Horizon-3.7B-GGUF
@@ -129,14 +170,14 @@ generation:
     temperature: 1.0
     top_p: 0.95
     top_k: 20
-    think_budget: 1024
+    think_budget: 768
     max_new_tokens: 3072
   solver:
     temperature: 0.8
     top_p: 0.95
     top_k: 20
-    think_budget: 768
-    max_new_tokens: 2048     # per turn
+    think_budget: 512
+    max_new_tokens: 1536     # per turn
 
 overthinking_bias:
   enabled: true
@@ -147,7 +188,7 @@ overthinking_bias:
 solver:
   use_pi: true               # false = single-shot answer in a ```python block (much faster)
   pi_tools: read,write,edit,bash
-  max_turns: 6               # model calls per attempt before the proxy ends the episode
+  max_turns: 4               # model calls per attempt before the proxy ends the episode (read, write, test, fix)
   timeout_s: 900
   visible_tests: 3           # examples shown in PROBLEM.md; grading uses all tests
 

@@ -20,6 +20,7 @@ import os
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import requests
@@ -47,7 +48,7 @@ class LlamaCppEngine(Engine):
                  parallel: int = 4, gpu_layers: str = "auto", threads: int | None = None,
                  log_file: str | None = None, extra_args: list[str] | None = None,
                  converter: dict | None = None, adapter_gguf_dir: str | None = None,
-                 swap_during_training: bool = False, startup_timeout: float = 900):
+                 swap_during_training: bool = False, startup_timeout: float = 900, spec_args: list[str] | None = None):
         self.tok = tok
         self.server_exe = server_exe
         self.gguf_path = gguf_path
@@ -59,6 +60,7 @@ class LlamaCppEngine(Engine):
         self.threads = threads
         self.log_file = log_file
         self.extra_args = extra_args or []
+        self.spec_args = spec_args or []      # KV type + speculative flags chosen by rollout_tune
         self.converter = converter or {}
         self.adapter_gguf_dir = Path(adapter_gguf_dir) if adapter_gguf_dir else None
         self.swap_during_training = swap_during_training
@@ -81,7 +83,7 @@ class LlamaCppEngine(Engine):
         files = [self.adapter_files[n] for n in ("maker", "solver") if n in self.adapter_files]
         if files:  # one comma-separated --lora (repeating the flag keeps only the last one)
             cmd += ["--lora", ",".join(files), "--lora-init-without-apply"]
-        return cmd + self.extra_args
+        return cmd + self.extra_args + self.spec_args
 
     def start(self):
         if self.proc and self.proc.poll() is None:
@@ -135,13 +137,18 @@ class LlamaCppEngine(Engine):
         assert self.adapter_gguf_dir is not None
         self.adapter_gguf_dir.mkdir(parents=True, exist_ok=True)
         new_files = {}
-        for name, peft_dir in adapter_dirs.items():
+
+        def convert(name, peft_dir):
             out = str(self.adapter_gguf_dir / f"{name}.gguf")
-            tmp = out + ".tmp"
-            convert_adapter_to_gguf(peft_dir, self.converter["base_model_dir"], tmp,
+            convert_adapter_to_gguf(peft_dir, self.converter["base_model_dir"], out + ".tmp",
                                     self.converter["script"], self.converter.get("python"),
                                     self.converter.get("gguf_py"))
-            new_files[name] = (tmp, out)
+            return name, (out + ".tmp", out)
+
+        # both adapters at once: each conversion is a separate Python process (mostly start-up time)
+        with ThreadPoolExecutor(max_workers=len(adapter_dirs) or 1) as ex:
+            for name, files in ex.map(lambda kv: convert(*kv), adapter_dirs.items()):
+                new_files[name] = files
         self.stop()  # the server holds the old files open (Windows cannot replace them otherwise)
         for name, (tmp, out) in new_files.items():
             os.replace(tmp, out)

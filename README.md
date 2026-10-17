@@ -45,8 +45,12 @@ Two LoRA adapters on one language model play a game, in the spirit of a GAN:
    sandbox, `log.txt` and `train.png` all work before you spend hours.
 4. Double-click **`run.bat`** to train. Open **`log.txt`** and **`train.png`** in the same folder; both
    are overwritten after every step. `log.txt` shows the **ETA** and the expected finish time.
+   **The whole run is capped at 3 hours** (`run.time_budget_hours: 3`, model loading included): a step
+   only starts if it should finish in time, then the run saves and stops cleanly. `log.txt` shows
+   "time budget 3 h: stops by HH:MM". Change the number in `config.yaml` (0 = no limit).
 5. Lab session over? Press **Ctrl+C** (it saves a checkpoint), or start with `run.bat --max-hours 5` so it
-   stops by itself. Next time, double-click **`resume.bat`**.
+   stops by itself. Next time, double-click **`resume.bat`**. A resumed run continues the same 3-hour
+   budget; raise `time_budget_hours` to train longer.
 
 Useful variations (append to `run.bat`, or edit `config.yaml`):
 
@@ -79,7 +83,8 @@ read and which allows files over 4 GB.
 
 | profile | when | model trained (LoRA) | rollouts | rough time / step* |
 |---|---|---|---|---|
-| `cuda_large` | NVIDIA ≥ 24 GB VRAM + ~32 GB RAM, e.g. **RTX 4090 (Purdue LWSN B131)** | **Qwen3.8-27B**, 4-bit NF4 (QLoRA) | `Qwen3.8-27B-UD-IQ4_XS.gguf` | 15–30 min |
+| `mac_mlx` | **Apple Silicon Mac** (e.g. M5 MacBook) | **two models:** Maker MiniCPM5-2B, Solver K2-Horizon-3.7B (both 4-bit MLX, LoRA each) | same models, in MLX | not measured yet |
+| `cuda_large` | NVIDIA ≥ 24 GB VRAM + ~32 GB RAM, e.g. **RTX 4090 (Purdue LWSN B131)** | **Qwen3.8-27B**, 4-bit NF4 (QLoRA) | `Qwen3.8-27B-UD-IQ4_XS.gguf` | ~7 min measured with 4 puzzles; steps are now 8 puzzles |
 | `cuda_mid` | NVIDIA 10–14 GB, e.g. RTX 2080 Ti | K2-Horizon-3.7B, NF4, fp16 | `K2-Horizon-4B-Q4_K_M.gguf` | 20–60 min |
 | `cuda_small` | NVIDIA 8–10 or 14–24 GB | Qwen3.5-4B, NF4 | Qwen3.5-4B Q4_K_M | 5–15 min |
 | `cpu` | **no NVIDIA, ≥ 28 GB RAM** (OptiPlex with 32 GB) | **K2-Horizon-7B**, bf16 | `K2-Horizon-7B-Q4_K_M.gguf` | **3–8 hours** |
@@ -87,7 +92,11 @@ read and which allows files over 4 GB.
 | `cpu_tiny` | no NVIDIA, < 14 GB RAM | Qwen3.5-0.8B, fp32 | Qwen3.5-0.8B Q4_K_M | 20–45 min |
 
 \* Back-of-the-envelope estimates for the default settings (4 puzzles × 4 Pi attempts per step), not
-measurements. The **ETA in `log.txt` is the real number**; it settles after about 3 steps. Training is
+measurements, except the 4090 figure, which was measured on LWSN B131 (that's what made 200 steps take
+~23 h). The 27B profile now does **fewer, bigger steps**: 8 puzzles × 4 attempts, 8 Pi attempts generating
+at once, an 8-bit KV cache, shorter thinking (Maker 768 / Solver 512 tokens) and at most 4 Pi turns. Each
+puzzle goes to the Solver as soon as it's validated, the two adapters convert in parallel, and that
+overlaps with moving the trainer to RAM. With the 3-hour budget, expect roughly 20–30 steps. The **ETA in `log.txt` is the real number**; it settles after about 3 steps. Training is
 the slow part on CPU: every step back-propagates through ~50–100k tokens. To go faster, use `--no-pi`
 (shorter sequences, roughly 2–3× faster), `--profile cpu_small` / `cpu_tiny`, or fewer `grpo.solver_attempts`.
 
@@ -123,6 +132,30 @@ Other Lawson labs (B146, B148, B158, B160, per the department's pages) have no G
 they get `cpu_small` (Qwen3.5-2B). The `cuda_mid` profile (K2-Horizon-3.7B in fp16, for 10–14 GB cards
 such as a 2080 Ti) stays available for older GPU machines. `setup.bat` always prints what it actually
 finds.
+
+**Apple Silicon (`mac_mlx`).** On a Mac the Maker and the Solver are **two different models**:
+**MiniCPM5-2B** (`openbmb/MiniCPM5-2B-MLX`, official 4-bit, 1.4 GB) writes the puzzles, and
+**K2-Horizon-3.7B** (`mlx-community/K2-Horizon-3.7B-4bit`, 4.1 GB) solves them inside Pi. Each has its own
+LoRA adapter, and both are sampled and trained in MLX in one process, so there's nothing to convert or sync
+between steps. The referee is **d3-nano** (`ggml-org/vllm-d3-nano-GGUF`, official Q8_0, 2.55 GB), loaded only
+while it's consulted; d3-flash (6.6 GB) doesn't fit next to both models on a 16 GB Mac. Install with
+`bash setup.sh` (it adds MLX on Apple Silicon), then `bash run.sh`.
+
+**Memory safety on the Mac.** MLX's default memory limit is about 1.5× the GPU's recommended working set,
+which on a 16 GB M5 is ~19 GB: more than the machine has. Once that is exhausted macOS swaps to disk,
+and with little free disk the whole system can freeze (this happened during development). The `mac_mlx`
+profile therefore:
+- caps MLX at 60 % of RAM;
+- checks memory, swap growth and free disk before every step, during generation and for each training
+  sample, and **stops cleanly with a checkpoint** ("STOPPED for safety: …") when one runs low;
+- reads memory from **macOS's own memory-pressure level and free percentage** (what `memory_pressure` and
+  Activity Monitor's pressure graph show), because the usual "available RAM" number counts cached files,
+  such as model weights read a minute ago, as used even though macOS frees them instantly.
+
+It stops at "critical" pressure, or at "warning" with < 15 % free, if swap grows > 2 GB, or if free disk
+drops below 10 GB. These limits are set under `safety:` in the profile.
+
+Close other heavy apps before training, keep 15+ GB of disk free, and resume after a safety stop.
 
 **K2-Horizon-7B on CPU** (the default with no GPU): IFM's dense 7B, chosen for its strong coding and
 agentic scores. It has to train in bf16, because fp32 weights alone would be 36 GB, more than the PC's
@@ -199,6 +232,27 @@ materialises for the whole sequence.
 - If the self-test finds that llama.cpp can't serve the adapters, training switches to the slower
   Hugging Face engine, which samples from the exact training weights.
 → `src/adv/engines/`
+
+**Rollout tuning on the 4090 (`cuda_large`).** Setup's self-test measures the fastest rollout settings
+on the actual machine and saves them in `state/engine.json` (`rollout`). Training then uses them, and the
+`log.txt` header shows which. Throughput is always timed with a batch of parallel requests, like the Pi
+attempts in a real step:
+1. **KV-cache type:** each of `kv_cache_types` (`q8_0`, `q4_0`, `f16`) is timed with plain decoding, and
+   the fastest is kept. One 4090 report says some KV types silently fall back to the CPU on this model.
+2. **Speculative decoding:** a drafter guesses several tokens and the 27B checks them all in one forward
+   pass, rejecting any token it wouldn't have produced. Candidates:
+   - the **MTP head** built into Unsloth's GGUF (`draft-mtp`, no extra file);
+   - **DFlash2** (`z-lab/Qwen3.8-27B-DFlash2-GGUF`, 1.1 GB);
+   - **n-gram lookup** (`ngram-mod`), alone or combined with either.
+
+   Each is tried at 8 and at 4 parallel slots, because speculation helps single streams most, and its
+   advantage is reported to vanish by ~4 concurrent requests. A candidate must still respond to the LoRA
+   adapter and agree with plain greedy decoding (≥ 95 %, so tiny rounding differences in batched
+   verification are tolerated; a broken output is not). It's used only if it beats plain decoding by ≥ 5 %
+   in throughput; otherwise rollouts stay plain.
+
+The base flags are `-ngl all --fit off` (one 4090 report saw erratic 9–20 tok/s with fit on) and
+flash attention on. Tuning takes ~10–20 minutes. Run `setup.bat` again after changing the candidates.
 
 ### 4.6 Pi + a recording proxy (agentic RL)
 Pi only speaks chat messages, but RL needs the exact tokens the model produced, so Pi talks to a small

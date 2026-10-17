@@ -54,6 +54,8 @@ def detect() -> dict:
 
 
 def pick_profile(info: dict) -> str:
+    if info.get("os") == "Darwin" and info.get("machine") == "arm64":
+        return "mac_mlx"     # Apple Silicon: MLX, MiniCPM5 Maker + K2-Horizon Solver
     vram = (info.get("cuda_device") or {}).get("vram_gb", 0) if info.get("torch_cuda") else 0
     if vram >= 23.5:
         return "cuda_large"

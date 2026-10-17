@@ -71,3 +71,63 @@ def test_sync_adapters_can_leave_server_stopped(tmp_path, monkeypatch):
     assert calls == ["stop"] and set(eng.adapter_files) == {"maker", "solver"}
     eng.sync_adapters({"maker": "a", "solver": "b"})
     assert calls == ["stop", "stop", "start"]
+
+
+def test_time_budget_stops_cleanly(sandbox_root):
+    cfg = _cfg(sandbox_root, 50)
+    cfg["run"]["time_budget_hours"] = 0.01   # 36 s: less than the reserve, so only the first step fits
+    Trainer(cfg, _args()).run()
+    log = (sandbox_root / "log.txt").read_text()
+    assert log.startswith("STOPPED: 0.01 h time budget reached after 1 steps")
+    run = sandbox_root / "runs" / "t"
+    assert len((run / "metrics.jsonl").read_text().splitlines()) == 1
+    assert (run / "checkpoints" / "latest.txt").read_text().strip() == "step_00001"
+
+
+def test_profile_overrides_only_affect_their_profile(sandbox_root):
+    big = Trainer(_cfg(sandbox_root, 1), _args(profile="cuda_large"))
+    small = Trainer(_cfg(sandbox_root, 1), _args(profile="cpu"))
+    assert big.cfg["grpo"]["puzzles_per_step"] == 8 and small.cfg["grpo"]["puzzles_per_step"] == 4
+
+
+def test_adapters_convert_concurrently_and_extra_args_reach_llama_server(tmp_path, monkeypatch):
+    import threading
+    import time as _t
+    import adv.engines.llamacpp as L
+    active, peak = [0], [0]
+    lock = threading.Lock()
+
+    def slow_convert(src, base, out, *a):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        _t.sleep(0.3)
+        Path(out).write_text("gguf")
+        with lock:
+            active[0] -= 1
+    monkeypatch.setattr(L, "convert_adapter_to_gguf", slow_convert)
+    eng = L.LlamaCppEngine(None, "llama-server", "m.gguf", converter={"base_model_dir": ".", "script": "x"},
+                           adapter_gguf_dir=str(tmp_path), extra_args=["-ctk", "q8_0", "--cache-ram", "2048"])
+    eng.stop = lambda: None
+    eng.sync_adapters({"maker": "a", "solver": "b"}, restart=False)
+    assert peak[0] == 2
+    cmd = eng._cmd()
+    assert cmd[-4:] == ["-ctk", "q8_0", "--cache-ram", "2048"] and "--lora" in cmd
+
+
+def test_memory_guard_stops_run_cleanly(sandbox_root):
+    from adv.safety import Limits, MemoryGuard
+    t = Trainer(_cfg(sandbox_root, 5), _args())
+    t.guard = MemoryGuard(Limits())
+    real_step = t.step
+
+    def step_then_trip(step):
+        row = real_step(step)
+        if step == 1:
+            t.guard.limits.min_free_disk_gb = 10 ** 9   # simulate running out of headroom
+        return row
+    t.step = step_then_trip
+    t.run()
+    log = (sandbox_root / "log.txt").read_text()
+    assert log.startswith("STOPPED for safety: only") and "checkpoint saved" in log
+    assert (sandbox_root / "runs" / "t" / "checkpoints" / "latest.txt").read_text().strip() == "step_00002"

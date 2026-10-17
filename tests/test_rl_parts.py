@@ -17,8 +17,33 @@ def test_hardware_profiles():
     assert pick_profile(gpu("NVIDIA GeForce RTX 4060 Ti", 17.2)) == "cuda_small"
     assert pick_profile(gpu("NVIDIA GeForce RTX 4090", 25.8)) == "cuda_large"   # Purdue LWSN B131 (measured)
     assert pick_profile({"ram_gb": 34.2}) == "cpu"            # OptiPlex 5000, 32 GB, no GPU
+    assert pick_profile({"os": "Darwin", "machine": "arm64", "ram_gb": 17.2}) == "mac_mlx"   # e.g. the M5 MacBook
     assert pick_profile({"ram_gb": 17.1}) == "cpu_small"      # Lawson Linux labs (16 GB, no GPU)
     assert pick_profile({"ram_gb": 8.5}) == "cpu_tiny"
+
+
+def test_time_budget_rules():
+    from adv.logbook import BUDGET_RESERVE_S, budget_allows_next_step, projected_remaining, steps_that_fit
+    H = 3 * 3600
+    assert budget_allows_next_step(0, None, H)                      # first step always runs
+    assert budget_allows_next_step(10_000, 300, 0)                  # 0 = no budget
+    assert budget_allows_next_step(H - BUDGET_RESERVE_S - 400, 300, H)
+    assert not budget_allows_next_step(H - BUDGET_RESERVE_S - 300, 300, H)   # 15 % safety margin
+    assert steps_that_fit(0, 600, H) == int((H - BUDGET_RESERVE_S) // 690)
+    cfg = {"run": {"total_steps": 200, "time_budget_hours": 3}, "decision": {"every": 10}}
+    e = ETA()
+    e.update(414)                                                    # ~7 min steps: 200 steps would be ~23 h
+    rem = projected_remaining(cfg, e, done=1, elapsed=600)
+    assert rem <= H - 600 and rem < 23 * 3600
+    cfg["run"]["time_budget_hours"] = 0
+    assert projected_remaining(cfg, e, done=1, elapsed=600) == 199 * 414
+
+
+def test_config_overrides():
+    from adv.config import apply_overrides
+    cfg = {"grpo": {"puzzles_per_step": 4}}
+    apply_overrides(cfg, {"grpo.puzzles_per_step": 8, "new.key": 1})
+    assert cfg == {"grpo": {"puzzles_per_step": 8}, "new": {"key": 1}}
 
 
 def test_learnability_shape():
@@ -114,4 +139,7 @@ def test_render_log_handles_empty_and_full():
     e = ETA()
     e.update(60)
     text = render_log(cfg=cfg, header=header, history=_history(3), eta=e, started=0, verdicts=[], sample=None)
-    assert "step 3 / 10" in text and "ETA" in text
+    assert "step 3 / 10" in text and "ETA" in text and "time budget" not in text
+    cfg["run"]["time_budget_hours"] = 3
+    text = render_log(cfg=cfg, header=header, history=_history(3), eta=e, started=0, verdicts=[], sample=None)
+    assert "time budget 3 h: stops by" in text

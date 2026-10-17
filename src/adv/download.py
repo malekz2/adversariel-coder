@@ -13,9 +13,18 @@ TRAIN_PATTERNS = ["*.json", "*.safetensors", "*.jinja", "*.txt", "*.model", "*.t
 
 
 def plan(cfg: dict, profile: str, with_d3: bool = True) -> list[dict]:
-    prof, d = cfg["profiles"][profile], cfg["decision"]
-    items = [{"repo": prof["train_repo"], "file": None, "why": "training weights (safetensors)"},
-             {"repo": prof["gguf_repo"], "file": prof["gguf_file"], "why": "rollout model (llama.cpp)"}]
+    prof = cfg["profiles"][profile]
+    C.apply_overrides(cfg, prof.get("overrides") or {})   # e.g. the Mac's smaller referee
+    d = cfg["decision"]
+    if prof.get("backend") == "mlx":   # two different models, each a complete MLX repo
+        items = [{"repo": prof["maker_repo"], "file": None, "why": "Maker model (MLX)"},
+                 {"repo": prof["solver_repo"], "file": None, "why": "Solver model (MLX)"}]
+    else:
+        items = [{"repo": prof["train_repo"], "file": None, "why": "training weights (safetensors)"},
+                 {"repo": prof["gguf_repo"], "file": prof["gguf_file"], "why": "rollout model (llama.cpp)"}]
+        if prof.get("speculative"):
+            sp = prof["speculative"]
+            items.append({"repo": sp["draft_repo"], "file": sp["draft_file"], "why": "speculative drafter (faster rollouts)"})
     if with_d3:
         items.append({"repo": d["d3_repo"], "file": d["d3_file"], "why": "referee d3-flash"})
     return items

@@ -13,7 +13,13 @@ IS_WINDOWS = os.name == "nt"
 
 def load(path: str | Path | None = None, overrides: dict | None = None) -> dict:
     cfg = yaml.safe_load(Path(path or ROOT / "config.yaml").read_text(encoding="utf-8"))
-    for dotted, value in (overrides or {}).items():
+    apply_overrides(cfg, overrides or {})
+    return cfg
+
+
+def apply_overrides(cfg: dict, overrides: dict) -> dict:
+    """Set dotted keys, e.g. {"grpo.puzzles_per_step": 8}, in place."""
+    for dotted, value in overrides.items():
         node = cfg
         *parents, last = dotted.split(".")
         for p in parents:
