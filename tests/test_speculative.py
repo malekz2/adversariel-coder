@@ -72,9 +72,16 @@ class FakeProbe:
     """Fake llama-server. speed[(kv, type, slots)] -> tok/s; output_mode[type] in {"ok","changed","lora_ignored"};
     crash: set of (kv) or (type) that fail to start."""
 
-    def __init__(self, speed, output_mode=None, crash=()):
+    def __init__(self, speed, output_mode=None, crash=(), free_mb=None, single=None):
         self.speed, self.mode, self.crash = speed, output_mode or {}, set(crash)
+        self.free_mb, self.single = free_mb or {}, single or {}   # (kv, type, slots) -> MiB free / tok/s alone
         self.cfg, self.starts = None, []
+
+    def vram(self):
+        return {"total": 24564, "used": 0, "free": self.free_mb.get(self.cfg, 20000)}
+
+    def single_speed(self):
+        return self.single.get(self.cfg)
 
     def start(self, args, log_name=None):
         kv = args[args.index("-ctk") + 1] if "-ctk" in args else None
@@ -177,7 +184,7 @@ def test_rollout_settings_turn_speculation_off_if_drafter_vanished(tmp_path):
 
 def test_profiles_without_tuning_are_unchanged():
     rs = rollout_settings({"parallel_slots": 4}, {}, None)
-    assert rs == {"kv_cache": None, "slots": 4, "args": [], "spec_label": "", "note": "", "speedup": None}
+    assert rs == {"kv_cache": None, "slots": 4, "args": [], "spec_label": "", "note": "", "speedup": None, "spec": None}
 
 
 def test_trainer_reads_the_tuned_settings(monkeypatch, tmp_path):
@@ -185,5 +192,24 @@ def test_trainer_reads_the_tuned_settings(monkeypatch, tmp_path):
     monkeypatch.setattr(C, "read_state", lambda name: {"rollout": {"ok": True, "kv_cache": "q4_0", "slots": 4,
                                                                    "speculative": {"type": "draft-mtp", "n_max": 3}}})
     stub = SimpleNamespace(prof={**PROF})
+    stub._draft_path = lambda: Trainer._draft_path(stub)
     rs = Trainer._rollout_settings(stub)
     assert rs["slots"] == 4 and stub.spec_label == "draft-mtp" and stub.rollout_label == "KV q4_0, 4 slots"
+
+
+def test_tuner_rejects_settings_that_only_fit_on_an_empty_gpu(tmp_path):
+    speed = {("q8_0", "none", 8): 60.0, ("q4_0", "none", 8): 58.0, ("f16", "none", 8): 66.0,
+             ("q8_0", "draft-dflash", 8): 90.0, ("q8_0", "draft-dflash", 4): 80.0}
+    free = {("f16", "none", 8): 700, ("q8_0", "draft-dflash", 8): 400}       # < 1.5 GB headroom
+    single = {("q4_0", "none", 8): 3.0}                                      # spilled into RAM
+    probe = FakeProbe(speed, free_mb=free, single=single)
+    d = tmp_path / "d.gguf"
+    d.write_text("x")
+    prof = {**PROF, "vram_headroom_gb": 1.5, "min_decode_tps": 12}
+    res = tune_rollouts(probe, base_args, prof, str(d), [[1], [2], [3]], [[4]] * 8, log=lambda *a: None,
+                        vram_fn=probe.vram)
+    assert res["kv_results"]["f16"].startswith("too tight for training (0.7 GB")
+    assert res["kv_results"]["q4_0"].startswith("too slow (3.0 tok/s")
+    assert res["kv_cache"] == "q8_0"
+    assert res["spec_results"]["draft-dflash @ 8 slots"].startswith("too tight")
+    assert res["speculative"]["type"] == "draft-dflash" and res["slots"] == 4   # fewer slots still tried

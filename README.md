@@ -254,6 +254,29 @@ attempts in a real step:
 The base flags are `-ngl all --fit off` (one 4090 report saw erratic 9–20 tok/s with fit on) and
 flash attention on. Tuning takes ~10–20 minutes. Run `setup.bat` again after changing the candidates.
 
+A setting is also rejected if it leaves less than `vram_headroom_gb` (1.5 GB) of GPU memory free. The
+tuner runs on an empty GPU, but during training the parked trainer still keeps ~1 GB there, so a setting
+that only just fits would overflow. It is also rejected if one stream runs slower than `min_decode_tps`.
+
+**The 1 tok/s guard (4090 speed).** On Windows, a GPU that runs out of memory doesn't report an error.
+The driver quietly moves the overflow into system RAM (Task Manager → Performance → GPU → "Shared GPU
+memory"), and the 27B drops from ~40 tok/s to ~1 tok/s. Training therefore checks every llama-server start:
+- **free GPU memory** after loading (nearly 0 means it has overflowed);
+- a **48-token speed test**.
+
+If either check fails, it restarts llama-server with settings that need less memory: speculation off,
+then KV q4_0, then 6 slots, then 4 slots, then `-ngl auto` with fit on. `log.txt` then starts with a
+`NOTE:` line saying what changed, and the setting that worked is remembered in `state\engine.json` for
+the next run. Running setup again re-tunes and clears it.
+
+Before each start, a llama-server left over from a crashed run on the same port is stopped. Only our own
+binary is matched.
+
+System RAM is protected too:
+- the model's saved prompt states (context checkpoints, ~150 MB each) are capped at 3 per slot;
+- the RAM prompt cache is capped at 1 GB;
+- PyTorch's pinned RAM from the training phase is released before rollouts.
+
 ### 4.6 Pi + a recording proxy (agentic RL)
 Pi only speaks chat messages, but RL needs the exact tokens the model produced, so Pi talks to a small
 OpenAI-compatible **proxy** (`src/adv/proxy.py`). The proxy:
@@ -335,6 +358,10 @@ consulted (so it doesn't take memory from training).
 - **Out of memory:** lower `ctx_per_slot`/`max_seq_len` in the profile, set `parallel_slots: 2`, or use
   a smaller profile.
 - **Everything is slow:** see section 3. `--no-pi`, `--profile cpu_small` and `cpu_tiny` are the big levers.
+- **Rollouts on the 4090 crawl (a few tok/s):** look at the `rollout speed` line and any `NOTE:`/`WARNING:`
+  at the top of `log.txt`, and at "Shared GPU memory" in Task Manager. It should stay near 0 during
+  rollouts. Close other programs that use the GPU (browsers with hardware acceleration, games), then run
+  `setup.bat` again so tuning sees the same free memory that training will.
 - **K2-Horizon prints `[ERROR] cache_position ... not documented` or a `cache_position` warning:**
   harmless. These are style checks from transformers about IFM's own model code; nothing is wrong.
 - **Tests:** from the project folder, `.venv\Scripts\python -m pytest tests` (Linux/macOS: `.venv/bin/python -m pytest tests`).

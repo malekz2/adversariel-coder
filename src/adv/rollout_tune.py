@@ -112,6 +112,15 @@ class LlamaServerProbe:
         d = r.json()
         return list(d.get("tokens") or []), d.get("timings") or {}
 
+    def single_speed(self, n: int = 48) -> float | None:
+        """One request alone: generation tok/s from llama-server's timings (prompt excluded)."""
+        r = requests.post(self.url + "/completion", timeout=900, json={
+            "prompt": [1, 2, 3, 4, 5, 6, 7, 8], "n_predict": n, "temperature": 0.0, "ignore_eos": True,
+            "cache_prompt": False, "lora": [{"id": 0, "scale": 0.0}]})
+        r.raise_for_status()
+        tps = (r.json().get("timings") or {}).get("predicted_per_second")
+        return round(float(tps), 1) if tps else None
+
     def throughput(self, prompts: list[list[int]], n: int, temperature: float = 0.8) -> dict:
         """All prompts at once (like parallel Pi attempts): generated tokens per wall-clock second."""
         t0 = time.monotonic()
@@ -135,9 +144,27 @@ def _lora_matters(tokens: dict) -> bool:
     return any(tokens[(i, 0.0)] != tokens[(i, 1.0)] for i in prompts)
 
 
+def _fits(probe, prof: dict, vram_fn) -> str | None:
+    """Why this running config can't be used in training, or None. Training keeps ~1 GB of the trainer's
+    CUDA state on the GPU, which the tuner's empty GPU doesn't have: require that much free (plus margin),
+    and a single-stream speed that rules out a silent spill into system RAM."""
+    need_mb = float(prof.get("vram_headroom_gb") or 0) * 1024
+    v = vram_fn() if vram_fn else None
+    if v and need_mb and v["free"] < need_mb:
+        return f"too tight for training ({v['free'] / 1024:.1f} GB VRAM free, needs {need_mb / 1024:.1f})"
+    floor = prof.get("min_decode_tps")
+    if floor:
+        tps = probe.single_speed()
+        if tps is not None and tps < float(floor):
+            return f"too slow ({tps} tok/s for one stream, floor {floor})"
+    return None
+
+
 def tune_rollouts(probe, base_args, prof: dict, draft_path: str | None, exact_prompts: list[list[int]],
-                  speed_prompts: list[list[int]], n_exact: int = 48, n_speed: int = 128, log=print) -> dict:
-    """base_args(kv_type, slots) -> llama-server args without speculation. Returns the chosen settings."""
+                  speed_prompts: list[list[int]], n_exact: int = 48, n_speed: int = 128, log=print,
+                  vram_fn=None) -> dict:
+    """base_args(kv_type, slots) -> llama-server args without speculation. Returns the chosen settings.
+    vram_fn() -> {"free": MiB, ...} or None (see adv.gpu.vram)."""
     slots0 = int(prof["parallel_slots"])
     kv_types = prof.get("kv_cache_types") or [None]
     spec = prof.get("speculative") or {}
@@ -154,6 +181,11 @@ def tune_rollouts(probe, base_args, prof: dict, draft_path: str | None, exact_pr
             log(f"[tune] KV {name}: failed to start")
             continue
         try:
+            why_not = _fits(probe, prof, vram_fn)
+            if why_not:
+                report["kv_results"][name] = why_not
+                log(f"[tune] KV {name}: rejected, {why_not}")
+                continue
             ref = _greedy(probe, exact_prompts, n_exact)
             if not _lora_matters(ref):
                 report["kv_results"][name] = "LoRA had no effect"
@@ -169,7 +201,7 @@ def tune_rollouts(probe, base_args, prof: dict, draft_path: str | None, exact_pr
         finally:
             probe.stop()
     if best is None:
-        return {**report, "ok": False, "reason": "no KV-cache type worked"}
+        return {**report, "ok": False, "reason": "no KV-cache type worked (see kv_results)"}
     base_tps, kv, ref = best
     chosen = {"kv_cache": kv, "slots": slots0, "speculative": None, "tokens_per_s": base_tps}
     report["baseline_tokens_per_s"] = base_tps
@@ -189,6 +221,11 @@ def tune_rollouts(probe, base_args, prof: dict, draft_path: str | None, exact_pr
                 log(f"[tune] {key}: failed to start")
                 break  # same type at fewer slots would fail the same way
             try:
+                why_not = _fits(probe, prof, vram_fn)
+                if why_not:
+                    report["spec_results"][key] = why_not
+                    log(f"[tune] {key}: rejected, {why_not}")
+                    continue  # fewer slots use less memory: try them
                 got = _greedy(probe, exact_prompts, n_exact)
                 if not _lora_matters(got):
                     report["spec_results"][key] = "LoRA had no effect with speculation on"
@@ -232,4 +269,44 @@ def rollout_settings(prof: dict, state: dict, draft_path: str | None) -> dict:
     elif prof.get("speculative") and not tuned.get("ok"):
         note = "speculative decoding off: not tuned yet (run setup again to run the self-test)"
     return {"kv_cache": kv, "slots": slots, "args": args, "spec_label": label, "note": note,
-            "speedup": tuned.get("speedup") if tuned.get("ok") else None}
+            "speedup": tuned.get("speedup") if tuned.get("ok") else None, "spec": choice}
+
+
+def fallback_ladder(prof: dict, rs: dict) -> list[dict]:
+    """Launch settings to step down through when llama-server starts too slow (GPU memory overflowing):
+    each rung needs less VRAM than the one before. Rung 0 is what rollout_settings chose."""
+    gl = prof.get("llama_gpu_layers", "auto")
+    cur = {"label": "as tuned", "kv": rs["kv_cache"], "slots": int(rs["slots"]), "spec": rs.get("spec"),
+           "gpu_layers": gl, "fit_on": False}
+    rungs = [dict(cur)]
+
+    def add(label, **change):
+        cur.update(change, label=label)
+        if any(all(r[k] == cur[k] for k in ("kv", "slots", "spec", "gpu_layers", "fit_on")) for r in rungs):
+            return
+        rungs.append(dict(cur))
+
+    if cur["spec"]:
+        add("speculative decoding off", spec=None)
+    if cur["kv"] and cur["kv"] != "q4_0" and "q4_0" in (prof.get("kv_cache_types") or []):
+        add("KV cache q4_0", kv="q4_0")
+    for n in (6, 4):
+        if cur["slots"] > n:
+            add(f"{n} parallel slots", slots=n)
+    if str(gl) not in ("auto", "0"):
+        add("-ngl auto, --fit on (llama.cpp keeps what does not fit on the CPU)", gpu_layers="auto", fit_on=True)
+    return rungs
+
+
+def rung_launch(prof: dict, rung: dict, draft_path: str | None) -> dict:
+    """LlamaCppEngine.reconfigure() arguments for one rung of fallback_ladder."""
+    args = ["-ctk", rung["kv"], "-ctv", rung["kv"]] if rung["kv"] else []
+    if rung["spec"]:
+        args += speculative_args(prof.get("speculative") or {}, rung["spec"], draft_path)
+    extra = [str(a) for a in prof.get("llama_extra_args") or []]
+    if rung["fit_on"]:
+        if "--fit" in extra:
+            i = extra.index("--fit")
+            extra = extra[:i] + extra[i + 2:]
+        extra += ["--fit", "on"]
+    return {"parallel": rung["slots"], "spec_args": args, "gpu_layers": rung["gpu_layers"], "extra_args": extra}

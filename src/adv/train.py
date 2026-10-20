@@ -143,7 +143,10 @@ class Trainer:
                     converter={"script": self.tools["convert_lora"], "gguf_py": self.tools["gguf_py"],
                                "python": sys.executable, "base_model_dir": str(train_dir)},
                     adapter_gguf_dir=str(self.run_dir / "adapters_gguf"),
-                    swap_during_training=prof["swap_engine_during_training"], spec_args=rs["args"])
+                    swap_during_training=prof["swap_engine_during_training"], spec_args=rs["args"],
+                    ctx_checkpoints=prof.get("ctx_checkpoints", 4), checkpoint_min_step=prof.get("checkpoint_min_step", 512),
+                    min_decode_tps=prof.get("min_decode_tps"))
+                self._init_ladder(rs)
             else:
                 from .engines.hf import HFEngine
                 self.engine = HFEngine(self.tok, self.policy)
@@ -224,9 +227,7 @@ class Trainer:
         """KV-cache type, parallel slots and speculative decoding: what setup's self-test measured as fastest
         with unchanged output (state/engine.json "rollout"), or the profile's defaults if it hasn't run."""
         from .rollout_tune import rollout_settings
-        spec = self.prof.get("speculative") or {}
-        draft = str(C.repo_dir(spec["draft_repo"]) / spec["draft_file"]) if spec.get("draft_repo") else None
-        rs = rollout_settings(self.prof, C.read_state("engine.json"), draft)
+        rs = rollout_settings(self.prof, C.read_state("engine.json"), self._draft_path())
         self.spec_label = rs["spec_label"]
         self.rollout_label = f"KV {rs['kv_cache'] or 'f16'}, {rs['slots']} slots"
         if rs["note"]:
@@ -235,6 +236,67 @@ class Trainer:
             print(f"speculative decoding: {rs['spec_label']} at {rs['slots']} slots, KV {rs['kv_cache']} "
                   f"(self-test: {rs['speedup']}x the throughput of plain decoding)")
         return rs
+
+    def _draft_path(self) -> str | None:
+        spec = self.prof.get("speculative") or {}
+        return str(C.repo_dir(spec["draft_repo"]) / spec["draft_file"]) if spec.get("draft_repo") else None
+
+    def _init_ladder(self, rs: dict):
+        """Settings to fall back to if llama-server starts too slow; resume where an earlier run ended up."""
+        from .rollout_tune import fallback_ladder
+        self.ladder, self.rung = fallback_ladder(self.prof, rs), 0
+        saved = C.read_state("engine.json").get("rollout_fallback") or {}
+        if saved.get("profile") == self.profile and 0 < int(saved.get("rung", 0)) < len(self.ladder):
+            self._apply_rung(int(saved["rung"]))
+            print(f"rollouts: starting at '{self.ladder[self.rung]['label']}' (an earlier run found the tuned "
+                  f"settings too slow: {saved.get('reason')}); run setup again to re-tune")
+
+    def _apply_rung(self, i: int):
+        from .rollout_tune import rung_launch
+        self.rung = i
+        r = self.ladder[i]
+        self.engine.reconfigure(**rung_launch(self.prof, r, self._draft_path()))
+        self.spec_label = r["spec"]["type"] if r["spec"] else ""
+        self.rollout_label = f"KV {r['kv'] or 'f16'}, {r['slots']} slots" + (", -ngl auto" if r["fit_on"] else "")
+
+    def _save_rung(self, reason: str):
+        st = C.read_state("engine.json")
+        st["rollout_fallback"] = {"profile": self.profile, "rung": self.rung,
+                                  "label": self.ladder[self.rung]["label"], "reason": reason}
+        try:
+            (C.state_dir() / "engine.json").write_text(json.dumps(st, indent=2))
+        except OSError as e:
+            print(f"could not save the rollout fallback to state/engine.json: {e}")
+
+    def _start_engine(self):
+        """Start the rollout engine; if llama-server comes up far too slow (GPU memory overflowing into
+        RAM), step down to settings that need less VRAM instead of generating at ~1 tok/s for hours."""
+        from .engines.llamacpp import EngineTooSlow
+        stepped = False
+        while True:
+            try:
+                self.engine.resume()
+            except EngineTooSlow as e:
+                if getattr(self, "rung", 0) + 1 >= len(getattr(self, "ladder", [])):
+                    self.engine_note = (f"WARNING: rollouts are slow even with the most conservative settings ({e}). "
+                                        "Check Task Manager > Performance > GPU for other programs using GPU memory.")
+                    print(self.engine_note)
+                    self.engine.min_decode_tps = None  # run anyway rather than stop: nothing smaller to try
+                    self.engine.min_free_vram_mb = 0
+                    self.engine.resume()               # checks off now: this start cannot loop back here
+                    return
+                before = self.ladder[self.rung]["label"]
+                self._apply_rung(self.rung + 1)
+                self.engine_note = (f"NOTE: llama-server was too slow with '{before}' ({e}); "
+                                    f"now using '{self.ladder[self.rung]['label']}' ({self.rollout_label})")
+                print(self.engine_note)
+                self._save_rung(str(e))
+                stepped = True
+                continue
+            tps = (getattr(self.engine, "last_check", None) or {}).get("tps")
+            if stepped and tps is not None:
+                self.engine_note += f", which runs at {tps} tok/s per stream"
+            return
 
     def _pick_engine(self) -> str:
         choice = self.cfg.get("engine", "auto")
@@ -346,6 +408,7 @@ class Trainer:
             from .safety import MemoryDanger
             raise MemoryDanger(self.guard.tripped)
         t_roll = time.monotonic() - t0
+        speed = self.engine.take_stats() if hasattr(self.engine, "take_stats") else {}
 
         by_uid: dict[str, list[Attempt]] = {}
         for a in attempts:
@@ -396,7 +459,9 @@ class Trainer:
             "gen_tokens": sum(len(t.gen.token_ids) for t in turns),
             "dead_group_frac": dead, "skipped_long": s_st["skipped_long"] + m_st["skipped_long"],
             "turn_limit_hits": sum(1 for a in attempts if a.rollout.truncated),
+            **speed,
         }
+        row["rollout_tps"] = round(row["gen_tokens"] / t_roll, 1) if t_roll > 0 else None
         for prefix, st in (("solver", s_st), ("maker", m_st)):
             for k in ("loss", "grad_norm", "samples", "tokens", "kl", "clip_frac", "nonfinite_grads"):
                 row[f"{prefix}_{k}"] = st.get(k)
@@ -423,8 +488,8 @@ class Trainer:
     def _rollout_phase(self):
         """GPU belongs to llama.cpp: optionally move the trainer to RAM, then make sure the server runs."""
         if self.offload_trainer and not self.policy.offload():
-            self.offload_trainer = False  # couldn't move it; llama.cpp then fits what it can (-ngl auto)
-        self.engine.resume()
+            self.offload_trainer = False  # couldn't move it; the start check below then steps down
+        self._start_engine()
 
     def _train_phase(self):
         """GPU belongs to the trainer: stop llama-server (swap profiles) and bring the weights back."""
@@ -434,7 +499,7 @@ class Trainer:
     def _sync_engine(self):
         """Push the freshly trained adapters into the rollout engine."""
         if self.engine_name != "llamacpp":
-            self.engine.resume()
+            self._start_engine()
             return
         from .policy import export_for_llamacpp
         export = self.run_dir / "adapters_export"
@@ -451,7 +516,9 @@ class Trainer:
                     self.offload_trainer = False
                 fut.result()
         else:
-            self.engine.sync_adapters(dirs, restart=restart)
+            self.engine.sync_adapters(dirs, restart=False)
+            if restart:
+                self._start_engine()
 
     # ------------------------------------------------------------------ checkpoints
     def save_checkpoint(self, step: int):
@@ -506,6 +573,8 @@ class Trainer:
             text += f"\noverthinking bias ({role}): {rep.summary()}"
         if self.bias_reports:
             text += "\n"
+        if getattr(self, "engine_note", ""):
+            text = self.engine_note + "\n\n" + text
         if note:
             text = note + "\n\n" + text
         atomic_write(self.log_path, text)

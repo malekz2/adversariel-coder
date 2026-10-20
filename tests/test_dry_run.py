@@ -52,6 +52,7 @@ def test_phases_keep_trainer_and_llama_server_off_the_gpu_at_the_same_time():
         policy=SimpleNamespace(offload=lambda: calls.append("trainer -> RAM") or True,
                                onload=lambda: calls.append("trainer -> GPU")),
         engine=SimpleNamespace(resume=lambda: calls.append("server up"), pause=lambda: calls.append("server down")))
+    stub._start_engine = lambda: Trainer._start_engine(stub)
     Trainer._rollout_phase(stub)
     Trainer._train_phase(stub)
     assert calls == ["trainer -> RAM", "server up", "server down", "trainer -> GPU"]

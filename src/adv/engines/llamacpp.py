@@ -17,15 +17,26 @@ Thinking-only bias is done in two passes:
 from __future__ import annotations
 
 import os
+import statistics
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import requests
 
+from .. import gpu
 from .base import Engine, GenParams, GenResult, count_markers
+
+
+class EngineTooSlow(RuntimeError):
+    """llama-server started but is far slower than this GPU should be (usually: VRAM overflowed into RAM)."""
+
+    def __init__(self, msg: str, tps: float | None = None, vram: dict | None = None):
+        super().__init__(msg)
+        self.tps, self.vram = tps, vram
 
 
 def convert_adapter_to_gguf(peft_dir: str, base_model_dir: str, out_file: str, convert_script: str,
@@ -48,7 +59,9 @@ class LlamaCppEngine(Engine):
                  parallel: int = 4, gpu_layers: str = "auto", threads: int | None = None,
                  log_file: str | None = None, extra_args: list[str] | None = None,
                  converter: dict | None = None, adapter_gguf_dir: str | None = None,
-                 swap_during_training: bool = False, startup_timeout: float = 900, spec_args: list[str] | None = None):
+                 swap_during_training: bool = False, startup_timeout: float = 900, spec_args: list[str] | None = None,
+                 ctx_checkpoints: int = 4, checkpoint_min_step: int = 512, min_decode_tps: float | None = None,
+                 min_free_vram_mb: int = 300, stale_ports: list[int] | None = None):
         self.tok = tok
         self.server_exe = server_exe
         self.gguf_path = gguf_path
@@ -65,6 +78,15 @@ class LlamaCppEngine(Engine):
         self.adapter_gguf_dir = Path(adapter_gguf_dir) if adapter_gguf_dir else None
         self.swap_during_training = swap_during_training
         self.startup_timeout = startup_timeout
+        # hybrid models (Qwen3.5/3.8 DeltaNet) can only reuse a cached prompt from a checkpoint of the
+        # recurrent state. Each one is ~150 MB of RAM per slot for the 27B, so keep only a few.
+        self.ctx_checkpoints, self.checkpoint_min_step = int(ctx_checkpoints), int(checkpoint_min_step)
+        self.min_decode_tps = float(min_decode_tps) if min_decode_tps else None
+        self.min_free_vram_mb = int(min_free_vram_mb)
+        self.stale_ports = list(stale_ports or [port])
+        self.last_check: dict = {}                # vram / single-stream speed measured at the last start
+        self._timings: list[dict] = []
+        self._tlock = threading.Lock()
         self.adapter_files: dict[str, str] = {}   # name -> gguf path
         self.adapter_ids: dict[str, int] = {}     # name -> server id
         self.proc: subprocess.Popen | None = None
@@ -74,8 +96,8 @@ class LlamaCppEngine(Engine):
     def _cmd(self) -> list[str]:
         cmd = [self.server_exe, "-m", self.gguf_path, "--host", "127.0.0.1", "--port", str(self.port),
                "-c", str(self.ctx_per_slot * self.max_parallel), "-np", str(self.max_parallel),
-               "-ngl", str(self.gpu_layers), "--no-webui", "--ctx-checkpoints", "32",
-               "--checkpoint-min-step", "0"]
+               "-ngl", str(self.gpu_layers), "--no-webui", "--ctx-checkpoints", str(self.ctx_checkpoints),
+               "--checkpoint-min-step", str(self.checkpoint_min_step)]
         if self.threads:
             cmd += ["-t", str(self.threads)]
         if self.log_file:
@@ -85,9 +107,25 @@ class LlamaCppEngine(Engine):
             cmd += ["--lora", ",".join(files), "--lora-init-without-apply"]
         return cmd + self.extra_args + self.spec_args
 
+    def reconfigure(self, *, parallel: int | None = None, spec_args: list[str] | None = None,
+                    gpu_layers: str | None = None, extra_args: list[str] | None = None):
+        """New launch settings (used when stepping down after a too-slow start); applied at the next start."""
+        self.stop()
+        if parallel is not None:
+            self.max_parallel = int(parallel)
+        if spec_args is not None:
+            self.spec_args = list(spec_args)
+        if gpu_layers is not None:
+            self.gpu_layers = gpu_layers
+        if extra_args is not None:
+            self.extra_args = list(extra_args)
+
     def start(self):
         if self.proc and self.proc.poll() is None:
             return
+        if self.gpu_layers not in (0, "0"):
+            gpu.kill_stale_servers(self.server_exe, self.stale_ports)
+        before = gpu.vram()
         out = open(self.log_file + ".stdout", "ab") if self.log_file else subprocess.DEVNULL
         self.proc = subprocess.Popen(self._cmd(), stdout=out, stderr=subprocess.STDOUT)
         t0 = time.monotonic()
@@ -101,8 +139,55 @@ class LlamaCppEngine(Engine):
                 pass
             time.sleep(1.0)
         else:
+            self.stop()
             raise RuntimeError("llama-server did not become healthy in time")
         self._read_adapter_ids()
+        self._check_health(before)
+
+    def _check_health(self, before: dict | None):
+        """Fail fast instead of generating at 1 tok/s for hours: a full GPU means the driver is spilling
+        into system RAM; a single-stream speed far below the GPU's normal one means the same, measured."""
+        after = gpu.vram()
+        tps = self.decode_speed() if self.min_decode_tps else None
+        self.last_check = {"vram_before": before, "vram_after": after, "tps": tps}
+        problems = []
+        if after and self.gpu_layers not in (0, "0") and after["free"] < self.min_free_vram_mb:
+            problems.append(f"GPU memory full ({gpu.fmt(after)}; Windows then spills into slow system RAM)")
+        if tps is not None and tps < self.min_decode_tps:
+            problems.append(f"{tps:.1f} tok/s for one stream, expected at least {self.min_decode_tps:g}")
+        if problems:
+            self.stop()
+            raise EngineTooSlow("; ".join(problems), tps, after)
+
+    def decode_speed(self, n: int = 48) -> float | None:
+        """Single-stream generation speed (tok/s, prompt excluded) on a short code prompt, no LoRA."""
+        try:
+            prompt = self.tok.encode("def fibonacci(n):\n    ") if self.tok is not None else [1, 2, 3, 4]
+        except Exception:
+            prompt = [1, 2, 3, 4]
+        body = {"prompt": prompt, "n_predict": n, "temperature": 0.0, "cache_prompt": False, "ignore_eos": True}
+        if self.adapter_ids:
+            body["lora"] = [{"id": i, "scale": 0.0} for i in self.adapter_ids.values()]
+        r = self.session.post(self.url + "/completion", json=body, timeout=600)
+        r.raise_for_status()
+        t = r.json().get("timings") or {}
+        tps = t.get("predicted_per_second")
+        return round(float(tps), 1) if tps else None
+
+    def take_stats(self) -> dict:
+        """Speed of the completions since the last call (from llama-server's own timings)."""
+        with self._tlock:
+            ts, self._timings = self._timings, []
+        if not ts:
+            return {}
+        per_stream = [t["predicted_per_second"] for t in ts if t.get("predicted_per_second") and t.get("predicted_n", 0) >= 8]
+        p_n = sum(t.get("prompt_n") or 0 for t in ts)
+        p_ms = sum(t.get("prompt_ms") or 0.0 for t in ts)
+        cache_n = sum(t.get("cache_n") or 0 for t in ts)
+        return {"decode_tps_stream": round(statistics.median(per_stream), 1) if per_stream else None,
+                "prefill_tps": round(1000 * p_n / p_ms, 0) if p_ms else None,
+                "prompt_cached_frac": round(cache_n / (cache_n + p_n), 2) if cache_n + p_n else None,
+                "prompt_tokens": p_n}
 
     def _read_adapter_ids(self):
         self.adapter_ids = {}
@@ -171,7 +256,11 @@ class LlamaCppEngine(Engine):
                             for name, i in self.adapter_ids.items()]
         r = self.session.post(self.url + "/completion", json=body, timeout=3600)
         r.raise_for_status()
-        return r.json()
+        d = r.json()
+        if d.get("timings"):
+            with self._tlock:
+                self._timings.append(d["timings"])
+        return d
 
     def generate(self, prompt_ids, params: GenParams, think_end: int | None) -> GenResult:
         tok = self.tok

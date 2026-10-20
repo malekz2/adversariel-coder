@@ -192,6 +192,14 @@ def render_log(*, cfg: dict, header: dict, history: list[dict], eta: ETA, starte
              f"budget hit {_f(last.get('think_forced_frac'))}   overthinking markers {_f(last.get('marker_rate_per_1k'), 1)} per 1k thinking tokens")
     L.append(f"generated tokens this step {last.get('gen_tokens', 0)}   rollout time {fmt_dur(last.get('rollout_seconds'))}   "
              f"train time {fmt_dur(last.get('train_seconds'))}")
+    if last.get("rollout_tps") is not None:
+        line = f"rollout speed {_f(last.get('rollout_tps'), 1)} tok/s overall"
+        if last.get("decode_tps_stream") is not None:
+            line += f"   {_f(last.get('decode_tps_stream'), 1)} tok/s per stream (median)"
+        if last.get("prefill_tps") is not None:
+            line += (f"   prompt reading {_f(last.get('prefill_tps'), 0)} tok/s, {last.get('prompt_tokens', 0)} tokens "
+                     f"({_f(last.get('prompt_cached_frac'))} reused from cache)")
+        L.append(line)
     L.append("--- TRAINING " + "-" * 58)
     L.append(f"solver: loss {_f(last.get('solver_loss'), 4)} grad-norm {_f(last.get('solver_grad_norm'), 3)} "
              f"samples {last.get('solver_samples', 0)} tokens {last.get('solver_tokens', 0)}   "

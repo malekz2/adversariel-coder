@@ -32,6 +32,27 @@ def _chunk_logprobs(h: torch.Tensor, targets: torch.Tensor, weight: torch.Tensor
     return logits.gather(-1, targets[:, None]).squeeze(-1) - torch.logsumexp(logits, dim=-1)
 
 
+def release_gpu_caches():
+    """Give cached memory back before llama-server needs it: PyTorch's cached VRAM, and the pinned
+    (page-locked) RAM that save_on_cpu used for activations. PyTorch keeps that pinned RAM after training,
+    and Windows can't page it out, so several GB of the 32 GB stay blocked during rollouts otherwise."""
+    import gc
+    gc.collect()
+    if not torch.cuda.is_available():
+        return False  # (empty_host_cache crashes on Apple's MPS; only CUDA has pinned activations here)
+    torch.cuda.empty_cache()
+    # torch >= 2.9: torch.accelerator.empty_host_cache(); older releases: torch._C._host_emptyCache()
+    for host_empty in (getattr(getattr(torch, "accelerator", None), "empty_host_cache", None),
+                       getattr(torch._C, "_host_emptyCache", None)):
+        if host_empty is not None:
+            try:
+                host_empty()
+                return True
+            except Exception:
+                pass
+    return False
+
+
 class Policy:
     def __init__(self, model_dir: str, lora_cfg: dict, optim_cfg: dict, quant_4bit: bool = False,
                  dtype: str = "bfloat16", device: str = "cpu", gradient_checkpointing: bool = True,
@@ -108,7 +129,7 @@ class Policy:
             self.model.get_base_model().to(self.home)
             return False
         self.device = torch.device("cpu")
-        torch.cuda.empty_cache()
+        release_gpu_caches()
         return True
 
     def onload(self):

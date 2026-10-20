@@ -209,15 +209,25 @@ def _selftest_rollouts(cfg, prof, base, gguf, lora_gguf, t) -> dict:
     extra = [str(a) for a in prof.get("llama_extra_args") or []]
     ctx = int(prof["ctx_per_slot"])
 
+    ckpt = ["--ctx-checkpoints", str(prof.get("ctx_checkpoints", 4)),
+            "--checkpoint-min-step", str(prof.get("checkpoint_min_step", 512))]   # same RAM use as training
+
     def base_args(kv, slots):
         args = ["-m", gguf, "--lora", lora_gguf, "--lora-init-without-apply", "-c", str(ctx * slots),
-                "-np", str(slots), "-ngl", str(prof["llama_gpu_layers"]), "--no-webui", *extra]
+                "-np", str(slots), "-ngl", str(prof["llama_gpu_layers"]), "--no-webui", *ckpt, *extra]
         return args + (["-ctk", kv, "-ctv", kv] if kv else [])
 
     print(f"[selftest] tuning rollouts ({n_req} parallel requests): KV types {prof.get('kv_cache_types')}, "
           f"speculative candidates {[c['type'] for c in spec.get('candidates') or []]} (takes ~10-20 min)")
+    from . import gpu
+    v = gpu.vram()
+    if v:
+        print(f"[selftest] GPU memory before tuning: {gpu.fmt(v)}")
+        if v["used"] > 2048:
+            print("[selftest] WARNING: other programs already use "
+                  f"{v['used'] / 1024:.1f} GB of GPU memory; close them for meaningful timings")
     res = tune_rollouts(LlamaServerProbe(t["llama_server"], cfg["ports"]["engine"]), base_args, prof, draft,
-                        exact_prompts, speed_prompts, log=print)
+                        exact_prompts, speed_prompts, log=print, vram_fn=gpu.vram)
     if res.get("ok"):
         sp = res["speculative"]["type"] if res.get("speculative") else "off"
         print(f"[selftest]   chosen: KV {res['kv_cache']}, {res['slots']} slots, speculative {sp}: "
@@ -247,6 +257,8 @@ def main(argv=None):
     if not (t["llama_server"] and t["convert_lora"]):
         result["reason"] = "llama-server or convert_lora_to_gguf.py missing"
     else:
+        from .gpu import kill_stale_servers
+        kill_stale_servers(t["llama_server"], [cfg["ports"]["engine"]])  # a crashed run's server holds VRAM + port
         work = Path(tempfile.mkdtemp(prefix="adv_selftest_"))
         try:
             for name in ("all", "mlp_only"):
